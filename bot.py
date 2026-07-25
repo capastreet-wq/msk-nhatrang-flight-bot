@@ -130,6 +130,37 @@ async def _search_direct(origin_code: str, start: date, end: date) -> list[Route
     return options
 
 
+async def _cheapest_direct_headline() -> str:
+    """Первая строка каждого сообщения: самый дешёвый прямой билет (один
+    билет до Нячанга, без сборки через хаб — то же значение "прямой", что и
+    у остальных RouteOption с label "Прямой из ...") Москва -> Нячанг на
+    ближайшие 3 дня. Отдельный, более узкий поиск от основного окна
+    (settings.search_start_date/end) — под наблюдение, что горящие
+    предложения появляются за пару-тройку дней до вылета."""
+    today = date.today()
+    near_end = today + timedelta(days=3)
+    try:
+        candidates = await get_cheapest_in_window(tp_client, "MOW", settings.destination, today, near_end)
+    except Exception:
+        log.exception("Ошибка поиска ближайшего прямого рейса MOW->CXR")
+        return "✈️ Не удалось проверить ближайшие прямые рейсы MOW→CXR (ошибка API)\n\n"
+    if not candidates:
+        return "✈️ На ближайшие 3 дня прямых билетов MOW→CXR не найдено в кэше Aviasales\n\n"
+    best = min(candidates, key=lambda c: c["price"])
+    try:
+        meta = await _get_route_metadata("MOW", settings.destination, {best["date"]})
+    except Exception:
+        log.exception("Ошибка получения метаданных для ближайшего прямого рейса MOW->CXR")
+        meta = {}
+    leg = _make_leg("MOW", settings.destination, best, meta.get(best["date"]))
+    total_family = estimate_total_price(leg.price)
+    return (
+        f"✈️ Самый дешёвый прямой MOW→CXR на ближайшие 3 дня: "
+        f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ на троих {_baggage_hint(leg.airline)}\n"
+        f"{leg.link}\n\n"
+    )
+
+
 async def _search_via_hub(origin_code: str, hub_code: str, hub_name: str, start: date, end: date) -> list[RouteOption]:
     """Подбирает пару билетов origin->hub и hub->CXR с реальным запасом на
     пересадку. v1/prices/calendar отдаёт время вылета (departure_at) для
@@ -138,7 +169,12 @@ async def _search_via_hub(origin_code: str, hub_code: str, hub_name: str, start:
     сравнить с временем вылета внутреннего рейса. Если для какой-то даты
     время не нашлось — используем запасной вариант: минимум
     min_hub_layover_days суток, с явной пометкой в названии варианта, что
-    время не подтверждено."""
+    время не подтверждено.
+
+    Ногу origin->hub учитываем, ТОЛЬКО если это прямой рейс (number_of_changes
+    == 0 в сырых данных v2/prices/latest) — иначе это уже две пересадки на
+    пути в Нячанг (по пути к хабу + сам хаб->CXR), а не одна, и оправдать
+    это сложнее даже при экономии в $100+."""
     dom_end = end + timedelta(days=settings.max_hub_layover_days)
     try:
         intl, dom = await asyncio.gather(
@@ -151,7 +187,9 @@ async def _search_via_hub(origin_code: str, hub_code: str, hub_name: str, start:
     if not intl or not dom:
         return []
 
-    intl_candidates = intl[:5]
+    intl_candidates = [c for c in intl if (c.get("raw") or {}).get("number_of_changes") == 0][:5]
+    if not intl_candidates:
+        return []
     intl_dates = {c["date"] for c in intl_candidates}
     dom_dates_needed = {
         c["date"] + timedelta(days=delta)
@@ -296,13 +334,14 @@ def _search_window() -> tuple[date, date]:
 
 async def run_search(chat_id: int, *, force_reply: bool) -> None:
     start, window_end = _search_window()
+    headline_info = await _cheapest_direct_headline()  # первая информация в любом сообщении, всегда
 
     try:
         options = await gather_route_options(start, window_end)
     except Exception:
         log.exception("Ошибка запроса к Travelpayouts для чата %s", chat_id)
         if force_reply:
-            await bot.send_message(chat_id, "Не удалось получить данные от Travelpayouts, попробуй позже.")
+            await bot.send_message(chat_id, headline_info + "Не удалось получить данные от Travelpayouts, попробуй позже.")
         return
 
     if not options:
@@ -313,7 +352,7 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
             )
             await bot.send_message(
                 chat_id,
-                "По этому направлению (включая варианты через хабы) пока нет данных в кэше Aviasales. "
+                headline_info + "По этому направлению (включая варианты через хабы) пока нет данных в кэше Aviasales. "
                 f"Проверь вручную:\n{fallback_link}",
             )
         return
@@ -340,7 +379,7 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
     mrv_tags = _deal_tags(best_mrv) if best_mrv else []
 
     top_shown = options[:5]
-    body = f"{'/'.join(settings.origins)} → {settings.destination}, в одну сторону:\n\n{format_results(options)}"
+    body = headline_info + f"{'/'.join(settings.origins)} → {settings.destination}, в одну сторону:\n\n{format_results(options)}"
     if best_mrv and best_mrv not in top_shown:
         body += f"\n\nОтдельно из Минеральных Вод:\n{format_option(best_mrv)}"
 
