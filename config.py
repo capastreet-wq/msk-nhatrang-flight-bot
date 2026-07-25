@@ -1,6 +1,7 @@
 """Настройки бота. Все значения берутся из .env (см. .env.example)."""
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -57,11 +58,27 @@ class Settings:
     children: int = 2            # 13 и 17 лет — по тарифам авиакомпаний это "взрослые" места (детский тариф обычно до 12 лет)
     infants: int = 0
 
+    # Если search_start_date/search_end_date заданы — используем их как
+    # фиксированный период поиска (конкретная поездка), а не окно
+    # "ближайшие search_window_days дней от сегодня". start подрезается по
+    # max(start, сегодня) на месте использования (bot.py), чтобы не искать
+    # билеты в уже прошедшую дату по мере того, как идёт время.
+    search_start_date: date | None = None
+    search_end_date: date | None = None
     search_window_days: int = 21
+
     check_interval_minutes: int = 20
     default_budget_rub: int = 30_000  # порог для отметки 🔥 — за ОДНОГО человека (сравнивается с ценой за взрослого, не с суммой на всю компанию)
     max_domestic_leg_rub: int = 8_000  # маршрут через хаб учитываем, только если внутренний перелёт до CXR дешевле этого
-    direct_priority_margin_rub: int = 2_500  # если прямой рейс дороже самого дешёвого варианта не больше чем на эту сумму — показываем его первым (не городим пересадку ради 2-3 тыс. разницы)
+
+    # Хаб-маршрут (через SGN/HAN/DAD) показываем/ставим впереди прямого,
+    # только если он реально экономит от hub_min_savings_usd на человека —
+    # иначе показываем прямой рейс, даже если хаб чуть дешевле. usd_rub_rate
+    # даёт перевод в рубли для сравнения с ценами Data API (те всегда в
+    # рублях) — курс приблизительный (ЦБ на 25.07.2026 ~78 ₽/$), обновляй
+    # вручную при сильных колебаниях, точность до рубля тут не нужна.
+    hub_min_savings_usd: float = 100.0
+    usd_rub_rate: float = 78.0
 
     # v2/prices/latest (источник цен) не отдаёт время рейсов, но v1/prices/
     # calendar отдаёт departure_at по датам для большинства маршрутов (кроме
@@ -82,6 +99,10 @@ class Settings:
     def total_passengers(self) -> int:
         return self.adults + self.children
 
+    @property
+    def hub_min_savings_rub(self) -> float:
+        return self.hub_min_savings_usd * self.usd_rub_rate
+
 
 def load_settings() -> Settings:
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -91,6 +112,9 @@ def load_settings() -> Settings:
     if not travelpayouts_token:
         raise RuntimeError("TRAVELPAYOUTS_TOKEN не задан в .env — см. README.md")
 
+    raw_start = os.environ.get("SEARCH_START_DATE", "").strip()
+    raw_end = os.environ.get("SEARCH_END_DATE", "").strip()
+
     return Settings(
         telegram_token=telegram_token,
         travelpayouts_token=travelpayouts_token,
@@ -98,11 +122,14 @@ def load_settings() -> Settings:
         origins=tuple(o.strip() for o in os.environ.get("ORIGINS", "MOW,MRV").split(",") if o.strip()),
         destination=os.environ.get("DESTINATION", "CXR"),
         currency=os.environ.get("CURRENCY", "rub"),
+        search_start_date=date.fromisoformat(raw_start) if raw_start else None,
+        search_end_date=date.fromisoformat(raw_end) if raw_end else None,
         search_window_days=int(os.environ.get("SEARCH_WINDOW_DAYS", 21)),
         check_interval_minutes=int(os.environ.get("CHECK_INTERVAL_MINUTES", 20)),
         default_budget_rub=int(os.environ.get("DEFAULT_BUDGET_RUB", 30_000)),
         max_domestic_leg_rub=int(os.environ.get("MAX_DOMESTIC_LEG_RUB", 8_000)),
-        direct_priority_margin_rub=int(os.environ.get("DIRECT_PRIORITY_MARGIN_RUB", 2_500)),
+        hub_min_savings_usd=float(os.environ.get("HUB_MIN_SAVINGS_USD", 100.0)),
+        usd_rub_rate=float(os.environ.get("USD_RUB_RATE", 78.0)),
         min_hub_layover_hours=int(os.environ.get("MIN_HUB_LAYOVER_HOURS", 6)),
         min_hub_layover_days=int(os.environ.get("MIN_HUB_LAYOVER_DAYS", 1)),
         max_hub_layover_days=int(os.environ.get("MAX_HUB_LAYOVER_DAYS", 3)),

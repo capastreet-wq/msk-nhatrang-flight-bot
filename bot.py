@@ -27,8 +27,7 @@ bot = Bot(token=settings.telegram_token, default=DefaultBotProperties(parse_mode
 dp = Dispatcher()
 tp_client = TravelpayoutsClient(settings.travelpayouts_token, settings.currency)
 
-ALERT_REMINDER_INTERVAL = timedelta(hours=24)
-ALERT_MEANINGFUL_DROP = 0.97  # слать повторный алерт, если цена упала минимум на 3%
+ALERT_MEANINGFUL_DROP = 0.97  # в заголовке отмечаем "цена упала", если ниже последней увиденной минимум на 3%
 MARKET_BEATING_RATIO = 0.85   # цена <= 85% медианы по текущей выдаче — считаем "заметно дешевле рынка"
 
 
@@ -53,29 +52,6 @@ def market_stats(options: list) -> tuple[float, int]:
     угаданная заранее."""
     prices = [o.total_price for o in options]
     return statistics.median(prices), len(prices)
-
-
-def _should_fire(chat: dict, is_good_deal: bool, current_price: float, prefix: str) -> bool:
-    """True, если по этому треку (prefix — 'last_alert' для общего лучшего
-    варианта, 'mrv_alert' отдельно для Минеральных Вод) стоит прислать
-    уведомление ПРЯМО СЕЙЧАС: сделка выгодна (ниже бюджета или заметно
-    дешевле рынка) и либо это первое такое обнаружение (или сделка пропадала
-    и появилась заново — см. run_search, где трек сбрасывается, когда
-    is_good_deal становится False), либо цена упала ещё минимум на 3%, либо
-    прошли сутки с последнего уведомления по этому треку."""
-    if not is_good_deal:
-        return False
-    last_price = chat.get(f"{prefix}_price")
-    last_at = chat.get(f"{prefix}_at")
-    if last_price is None:
-        return True
-    if current_price <= last_price * ALERT_MEANINGFUL_DROP:
-        return True
-    if last_at:
-        last_dt = datetime.fromisoformat(last_at)
-        if datetime.now(timezone.utc) - last_dt > ALERT_REMINDER_INTERVAL:
-            return True
-    return False
 
 
 @dataclass
@@ -244,9 +220,10 @@ async def _search_via_hub(origin_code: str, hub_code: str, hub_name: str, start:
 
 def _apply_direct_priority(options: list[RouteOption]) -> None:
     """Прямой перелёт (1 нога, сразу до Нячанга) ставим первым, если он
-    дороже самого дешёвого варианта не больше чем на direct_priority_margin_rub —
-    не стоит городить пересадку через хаб ради разницы в 2-3 тыс. рублей,
-    когда можно долететь до конечной точки одним рейсом."""
+    дороже самого дешёвого варианта не больше чем на hub_min_savings_rub
+    (по умолчанию $100/чел. по курсу settings.usd_rub_rate) — пересадка
+    через хаб того стоит, только если реально экономит эту сумму на
+    человека, иначе не городим лишний билет и риск стыковки ради мелочи."""
     if not options:
         return
     cheapest_price = options[0].total_price
@@ -256,7 +233,7 @@ def _apply_direct_priority(options: list[RouteOption]) -> None:
     best_direct = min(direct_options, key=lambda o: o.total_price)
     if best_direct is options[0]:
         return
-    if best_direct.total_price - cheapest_price <= settings.direct_priority_margin_rub:
+    if best_direct.total_price - cheapest_price <= settings.hub_min_savings_rub:
         options.remove(best_direct)
         options.insert(0, best_direct)
 
@@ -307,12 +284,21 @@ def format_results(options: list[RouteOption], limit: int = 5) -> str:
     return "\n\n".join(format_option(o) for o in options[:limit])
 
 
-async def run_search(chat_id: int, *, force_reply: bool) -> None:
+def _search_window() -> tuple[date, date]:
+    """Если задан фиксированный период (конкретная поездка) — используем его,
+    подрезая начало по сегодняшнему дню, чтобы не искать в уже прошедшую
+    дату. Иначе — обычное скользящее окно от сегодня."""
     today = date.today()
-    window_end = today + timedelta(days=settings.search_window_days)
+    if settings.search_start_date and settings.search_end_date:
+        return max(settings.search_start_date, today), settings.search_end_date
+    return today, today + timedelta(days=settings.search_window_days)
+
+
+async def run_search(chat_id: int, *, force_reply: bool) -> None:
+    start, window_end = _search_window()
 
     try:
-        options = await gather_route_options(today, window_end)
+        options = await gather_route_options(start, window_end)
     except Exception:
         log.exception("Ошибка запроса к Travelpayouts для чата %s", chat_id)
         if force_reply:
@@ -322,7 +308,7 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
     if not options:
         if force_reply:
             fallback_link = build_booking_link(
-                settings.origins[0], settings.destination, today + timedelta(days=7),
+                settings.origins[0], settings.destination, start,
                 settings.adults, settings.children, settings.infants, settings.travelpayouts_marker,
             )
             await bot.send_message(
@@ -347,20 +333,17 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
         return tags
 
     overall_tags = _deal_tags(best)
-    is_good_deal = bool(overall_tags)
 
     mrv_options = [o for o in options if o.legs[0].origin == "MRV"]
     best_mrv = mrv_options[0] if mrv_options else None
     mrv_total_estimate = estimate_total_price(best_mrv.total_price) if best_mrv else None
     mrv_tags = _deal_tags(best_mrv) if best_mrv else []
-    mrv_is_good_deal = bool(mrv_tags)
 
     top_shown = options[:5]
     body = f"{'/'.join(settings.origins)} → {settings.destination}, в одну сторону:\n\n{format_results(options)}"
     if best_mrv and best_mrv not in top_shown:
         body += f"\n\nОтдельно из Минеральных Вод:\n{format_option(best_mrv)}"
 
-    chat = store.get_chat(chat_id)
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if force_reply:
@@ -370,29 +353,32 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
             store.update_alert_state(chat_id, mrv_total_estimate, now_iso, prefix="mrv_alert")
         return
 
-    overall_fire = _should_fire(chat, is_good_deal, total_estimate, "last_alert")
-    if not is_good_deal and chat.get("last_alert_price") is not None:
-        store.update_alert_state(chat_id, None, None, prefix="last_alert")  # сделка пропала — сброс, чтобы новая считалась "первой"
-
-    mrv_fire = bool(best_mrv) and _should_fire(chat, mrv_is_good_deal, mrv_total_estimate, "mrv_alert")
-    if best_mrv and not mrv_is_good_deal and chat.get("mrv_alert_price") is not None:
-        store.update_alert_state(chat_id, None, None, prefix="mrv_alert")
-
-    if not (overall_fire or mrv_fire):
-        return
-
-    lines = ["✈️ Появился выгодный вариант!"]
-    if overall_fire:
-        lines.extend(overall_tags)
-    if mrv_fire:
-        lines.append("Из Минеральных Вод: " + ", ".join(mrv_tags))
-    headline = "\n".join(lines)
+    # Плановая проверка шлёт сообщение КАЖДЫЙ РАЗ, не только когда выгодно —
+    # так видно динамику цен и можно понять, что на этом маршруте вообще
+    # считается средней ценой, а не только моменты явных распродаж (🔥/🎯).
+    chat = store.get_chat(chat_id)
+    last_price = chat.get("last_alert_price")
+    if last_price is None:
+        headline = "✈️ Первая проверка — вот что нашёл:"
+    elif total_estimate <= last_price * ALERT_MEANINGFUL_DROP:
+        headline = f"📉 Цена упала! Было {last_price:.0f} ₽, стало {total_estimate:.0f} ₽ (на всех):"
+    else:
+        headline = "📊 Текущие цены:"
+    if overall_tags:
+        headline += "\n" + "\n".join(overall_tags)
+    if mrv_tags:
+        headline += "\nИз Минеральных Вод: " + ", ".join(mrv_tags)
 
     await bot.send_message(chat_id, f"{headline}\n\n{body}")
-    if overall_fire:
-        store.update_alert_state(chat_id, total_estimate, now_iso)
-    if mrv_fire:
+    store.update_alert_state(chat_id, total_estimate, now_iso)
+    if best_mrv:
         store.update_alert_state(chat_id, mrv_total_estimate, now_iso, prefix="mrv_alert")
+
+
+def _window_description() -> str:
+    if settings.search_start_date and settings.search_end_date:
+        return f"с {settings.search_start_date:%d.%m} по {settings.search_end_date:%d.%m}"
+    return f"на ближайшие {settings.search_window_days} дней"
 
 
 @dp.message(Command("start"))
@@ -405,15 +391,16 @@ async def cmd_start(message: Message) -> None:
         f"{'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}, "
         f"конечная точка всегда Нячанг), в одну сторону, "
         f"{settings.adults} взрослый + {settings.children} ребёнка, "
-        f"на ближайшие {settings.search_window_days} дней — включая варианты через хабы "
-        f"({', '.join(HUBS.values())}) с недорогим внутренним перелётом. Если прямой рейс дороже "
-        f"самого дешёвого варианта не больше чем на {settings.direct_priority_margin_rub} ₽ — "
-        "показываю прямой (без пересадки через хаб).\n"
-        f"Проверяю раз в {settings.check_interval_minutes} мин. и пишу тебе САМ, только когда находится "
-        "выгодный вариант (ниже твоего порога или заметно дешевле рынка) — не нужно спрашивать вручную, "
-        "и не шлю лишнего, если ничего выгодного нет.\n"
-        f"Отдельно слежу за Минеральными Водами — если появится выгодный вариант оттуда, "
-        "напишу, даже если он дороже московского.\n"
+        f"{_window_description()} — включая варианты через хабы "
+        f"({', '.join(HUBS.values())}): пересадку через хаб показываю впереди прямого, только если "
+        f"она реально экономит от ${settings.hub_min_savings_usd:.0f}/чел. (~{settings.hub_min_savings_rub:.0f} ₽ "
+        f"по курсу {settings.usd_rub_rate:.0f} ₽/$), иначе показываю прямой рейс.\n"
+        f"Проверяю раз в {settings.check_interval_minutes} мин. и пишу тебе САМ каждый раз — не нужно "
+        "спрашивать вручную. Так видно, как вообще меняются цены на маршруте, а не только моменты "
+        "явных распродаж — те дополнительно помечаю значками 🔥 (ниже твоего порога) и 🎯 (заметно "
+        "дешевле текущей медианы по рынку).\n"
+        f"Отдельно слежу за Минеральными Водами — если по ним появляется что-то стоящее, отмечаю "
+        "отдельной строкой, даже если общий лучший вариант сейчас из Москвы.\n"
         f"Порог для отметки 🔥: {budget} ₽/чел. (можно менять через /setbudget).\n\n"
         "Команды:\n"
         "/check — проверить цены прямо сейчас\n"
@@ -452,17 +439,18 @@ async def cmd_status(message: Message) -> None:
         "в одну сторону, конечная точка всегда Нячанг\n"
         f"Плюс варианты через хабы: {', '.join(f'{name} ({code})' for code, name in HUBS.items())} "
         f"— если внутренний перелёт до {settings.destination} дешевле {settings.max_domestic_leg_rub} ₽\n"
-        f"Приоритет прямого рейса: если он дороже самого дешёвого варианта не больше чем на "
-        f"{settings.direct_priority_margin_rub} ₽ — показываю прямой\n"
+        f"Приоритет прямого рейса: хаб-маршрут показываю впереди прямого, только если экономит от "
+        f"${settings.hub_min_savings_usd:.0f}/чел. (~{settings.hub_min_savings_rub:.0f} ₽ по курсу "
+        f"{settings.usd_rub_rate:.0f} ₽/$) — иначе показываю прямой\n"
         f"Запас на стыковку через хаб: ≥{settings.min_hub_layover_hours}ч, если время рейсов нашлось "
         f"в календаре Aviasales; если нет — подстраховка минимум {settings.min_hub_layover_days} сутки "
         "(с пометкой ⚠️ в названии варианта)\n"
         f"Багаж: 🧳✅/❌/❓ по типу перевозчика (не по тарифу — сверяй при бронировании)\n"
-        f"Окно поиска: ближайшие {settings.search_window_days} дней от сегодня\n"
+        f"Окно поиска: {_window_description()}\n"
         f"Пассажиры: {settings.adults} взрослый + {settings.children} ребёнка "
         "(оба тарифицируются как взрослые — детский тариф обычно до ~12 лет)\n"
-        "Сигналы: пишу сам, БЕЗ запроса, только когда есть выгодный вариант (🔥 или 🎯 ниже) — "
-        "если ничего выгодного нет, молчу\n"
+        "Сигналы: пишу сам, БЕЗ запроса, на каждой проверке — чтобы было видно динамику цен, "
+        "а не только моменты явных распродаж (те дополнительно отмечены 🔥/🎯)\n"
         f"Порог для отметки 🔥: {budget} ₽/чел.\n"
         f"Отметка 🎯: цена ≤{MARKET_BEATING_RATIO*100:.0f}% от медианы по текущей выдаче — "
         "«заметно дешевле рынка», медиана считается заново на каждой проверке\n"
@@ -496,8 +484,8 @@ async def main() -> None:
     scheduler.add_job(scheduled_job, "interval", minutes=settings.check_interval_minutes)
     scheduler.start()
     log.info(
-        "Бот запущен: %s -> %s, окно %s дней, проверка каждые %s мин.",
-        "/".join(settings.origins), settings.destination, settings.search_window_days, settings.check_interval_minutes,
+        "Бот запущен: %s -> %s, окно %s, проверка каждые %s мин.",
+        "/".join(settings.origins), settings.destination, _window_description(), settings.check_interval_minutes,
     )
     await scheduled_job()
     try:
