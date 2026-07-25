@@ -1,0 +1,46 @@
+name: Check flight prices
+
+on:
+  schedule:
+    # GitHub не гарантирует минутную точность (в пиковые моменты бывают
+    # задержки в несколько минут) и может пропускать/сдвигать запуски —
+    # это ориентир на CHECK_INTERVAL_MINUTES=20 из config.py, а не гарантия.
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+# Не даём двум прогонам работать параллельно — иначе оба могут одновременно
+# читать/коммитить data/state.json и получится гонка состояний.
+concurrency:
+  group: check-flights
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run price check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+          TRAVELPAYOUTS_MARKER: ${{ secrets.TRAVELPAYOUTS_MARKER }}
+        run: python run_once.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "flight-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/state.json data/update_offset.txt
+          git diff --staged --quiet || git commit -m "Update bot state [skip ci]"
+          git push

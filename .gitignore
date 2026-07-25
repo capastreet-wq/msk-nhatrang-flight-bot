@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 .venv/
-data/state.json
 data/*.tmp
 logs/
+
+# data/state.json и data/update_offset.txt НЕ игнорируем — в режиме GitHub
+# Actions (см. .github/workflows/) это единственная персистентность между
+# запусками, workflow коммитит их обратно в репозиторий после каждого прогона.
