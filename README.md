@@ -220,7 +220,40 @@ Aviasales обновляются не мгновенно — проверка ч
 
 ## Постоянный запуск (чтобы бот работал 24/7)
 
-Самый простой вариант — `systemd` на любом Linux-сервере/VPS или Raspberry Pi:
+### На macOS — `launchd` (уже настроено на этой машине)
+
+`systemd` в macOS нет, а Docker не установлен, поэтому бот запущен через
+`launchd` — встроенный менеджер процессов macOS, который сам поднимает
+процесс при логине/перезагрузке и перезапускает его, если он упал
+(`KeepAlive`). Конфиг: `~/Library/LaunchAgents/com.sofa.nhatrang-flight-bot.plist`,
+логи — `logs/bot.log` в папке проекта. Автоперезапуск после `kill -9`
+проверен вручную — восстанавливается за пару секунд.
+
+Команды для управления:
+
+```bash
+# Статус (running / not running, PID, пути)
+launchctl print gui/$(id -u)/com.sofa.nhatrang-flight-bot
+
+# Логи в реальном времени
+tail -f ~/projects/msk-nhatrang-flight-bot/logs/bot.log
+
+# Перезапустить (например, после обновления кода)
+launchctl kickstart -k gui/$(id -u)/com.sofa.nhatrang-flight-bot
+
+# Полностью остановить и убрать из автозапуска
+launchctl bootout gui/$(id -u)/com.sofa.nhatrang-flight-bot
+
+# Включить заново
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sofa.nhatrang-flight-bot.plist
+```
+
+Важно: `RunAtLoad` запускает бота при входе в аккаунт macOS — если Mac
+полностью выключен (не спит, а именно выключен) или разлогинен, бот не
+работает, пока не войдёшь в систему снова. Для сервера без выхода из
+системы (VPS/выделенная машина) — см. `systemd`/Docker ниже.
+
+### На Linux-сервере/VPS — `systemd`
 
 ```ini
 # /etc/systemd/system/nhatrang-flight-bot.service
