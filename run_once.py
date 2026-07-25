@@ -8,10 +8,12 @@
 обрабатываются с задержкой до следующего запуска по расписанию (а не мгновенно).
 """
 import asyncio
+from datetime import datetime, timezone
 
 from bot import bot, dp, log, scheduled_job, settings, tp_client
 
 OFFSET_FILE = settings.data_dir / "update_offset.txt"
+LAST_RUN_FILE = settings.data_dir / "last_run.txt"
 
 
 async def process_pending_updates() -> None:
@@ -33,9 +35,20 @@ async def process_pending_updates() -> None:
         OFFSET_FILE.write_text(str(offset))
 
 
+def _touch_last_run() -> None:
+    """Меняется на каждом запуске (в отличие от state.json, который коммитится,
+    только когда что-то реально изменилось) — чтобы в репозитории всегда была
+    свежая активность. Без этого GitHub автоматически отключает schedule-триггер
+    после 60 дней без активности в репозитории — если цена стабильна долго,
+    state.json может не меняться неделями, и расписание тихо отключится."""
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    LAST_RUN_FILE.write_text(datetime.now(timezone.utc).isoformat())
+
+
 async def main() -> None:
     await process_pending_updates()
     await scheduled_job()
+    _touch_last_run()
     await tp_client.aclose()
     await bot.session.close()
 
