@@ -1,6 +1,6 @@
-"""Telegram-бот: мониторит цены на билеты Москва (MOW) -> Нячанг (CXR), в одну
-сторону, и шлёт алерт, когда цена на всю компанию (1 взрослый + 2 ребёнка)
-падает ниже заданного порога. Настройки — в .env, инструкция — в README.md.
+"""Telegram-бот: мониторит цены на авиабилеты (маршрут и даты — в config.py/.env)
+и присылает сообщение на каждой проверке, с отметками, когда цена особенно
+выгодна. Настройки — в .env, инструкция — в README.md.
 """
 import asyncio
 import logging
@@ -32,10 +32,19 @@ MARKET_BEATING_RATIO = 0.85   # цена <= 85% медианы по текуще
 
 
 def estimate_total_price(single_adult_price: float) -> float:
-    """Data API отдаёт цену за 1 взрослого; детский тариф у авиакомпаний обычно
-    действует только до ~12 лет, а нашим двоим детям 13 и 17 — поэтому все
-    3 билета по факту стоят как взрослые. Это оценка, а не точная цена."""
+    """Data API отдаёт цену за 1 взрослого — умножаем на общее число
+    пассажиров (settings.total_passengers, все считаются взрослыми, см.
+    Settings.adults/children). Это оценка, а не точная цена."""
     return single_adult_price * settings.total_passengers
+
+
+_PASSENGER_COUNT_WORDS = {1: "одного", 2: "двоих", 3: "троих", 4: "четверых", 5: "пятерых", 6: "шестерых"}
+
+
+def _total_label() -> str:
+    n = settings.total_passengers
+    word = _PASSENGER_COUNT_WORDS.get(n)
+    return f"на {word}" if word else f"на {n} человек"
 
 
 def budget_for_chat(chat_id: int) -> int:
@@ -157,7 +166,7 @@ async def _cheapest_direct_headline() -> str:
     total_family = estimate_total_price(leg.price)
     return (
         f"✈️ Самый дешёвый прямой {origin}→{settings.destination} на ближайшие 3 дня: "
-        f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ на троих {_baggage_hint(leg.airline)}\n"
+        f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()} {_baggage_hint(leg.airline)}\n"
         f"{leg.link}\n\n"
     )
 
@@ -316,7 +325,7 @@ def format_option(option: RouteOption) -> str:
         for leg in option.legs
     ]
     return (
-        f"{first_leg_dt} — {option.label} — {option.total_price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ на троих\n"
+        f"{first_leg_dt} — {option.label} — {option.total_price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()}\n"
         + "\n".join(leg_lines)
     )
 
@@ -424,6 +433,25 @@ def _window_description() -> str:
     return f"на ближайшие {settings.search_window_days} дней"
 
 
+def _plural_ru(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return few
+    return many
+
+
+def _passengers_description() -> str:
+    """Все пассажиры считаются взрослыми (см. Settings.adults/children) —
+    описание собирается динамически, а не зашито под конкретное число детей."""
+    parts = [f"{settings.adults} {_plural_ru(settings.adults, 'взрослый', 'взрослых', 'взрослых')}"]
+    if settings.children:
+        parts.append(f"{settings.children} {_plural_ru(settings.children, 'ребёнок', 'ребёнка', 'детей')}")
+    if settings.infants:
+        parts.append(f"{settings.infants} {_plural_ru(settings.infants, 'младенец', 'младенца', 'младенцев')}")
+    return " + ".join(parts)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     store.subscribe(message.chat.id)
@@ -447,7 +475,7 @@ async def cmd_start(message: Message) -> None:
         "Привет! Слежу за билетами "
         f"{'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}, "
         f"конечная точка всегда {settings.destination}), в одну сторону, "
-        f"{settings.adults} взрослый + {settings.children} ребёнка, "
+        f"{_passengers_description()}, "
         f"{hub_line}"
         f"Проверяю раз в {settings.check_interval_minutes} мин. и пишу тебе САМ каждый раз — не нужно "
         "спрашивать вручную. Так видно, как вообще меняются цены на маршруте, а не только моменты "
@@ -505,8 +533,8 @@ async def cmd_status(message: Message) -> None:
         f"{hub_lines}"
         f"Багаж: 🧳✅/❌/❓ по типу перевозчика (не по тарифу — сверяй при бронировании)\n"
         f"Окно поиска: {_window_description()}\n"
-        f"Пассажиры: {settings.adults} взрослый + {settings.children} ребёнка "
-        "(оба тарифицируются как взрослые — детский тариф обычно до ~12 лет)\n"
+        f"Пассажиры: {_passengers_description()} (все считаются взрослыми — детский "
+        "тариф обычно действует примерно до 12 лет)\n"
         "Сигналы: пишу сам, БЕЗ запроса, на каждой проверке — чтобы было видно динамику цен, "
         "а не только моменты явных распродаж (те дополнительно отмечены 🔥/🎯)\n"
         f"Порог для отметки 🔥: {budget} ₽/чел.\n"
