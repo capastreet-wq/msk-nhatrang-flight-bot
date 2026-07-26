@@ -132,30 +132,31 @@ async def _search_direct(origin_code: str, start: date, end: date) -> list[Route
 
 async def _cheapest_direct_headline() -> str:
     """Первая строка каждого сообщения: самый дешёвый прямой билет (один
-    билет до Нячанга, без сборки через хаб — то же значение "прямой", что и
-    у остальных RouteOption с label "Прямой из ...") Москва -> Нячанг на
-    ближайшие 3 дня. Отдельный, более узкий поиск от основного окна
-    (settings.search_start_date/end) — под наблюдение, что горящие
-    предложения появляются за пару-тройку дней до вылета."""
+    билет, без сборки через хаб — то же значение "прямой", что и у остальных
+    RouteOption с label "Прямой из ...") по первому аэропорту вылета
+    (settings.origins[0]) на ближайшие 3 дня. Отдельный, более узкий поиск
+    от основного окна (settings.search_start_date/end) — под наблюдение,
+    что горящие предложения появляются за пару-тройку дней до вылета."""
+    origin = settings.origins[0]
     today = date.today()
     near_end = today + timedelta(days=3)
     try:
-        candidates = await get_cheapest_in_window(tp_client, "MOW", settings.destination, today, near_end)
+        candidates = await get_cheapest_in_window(tp_client, origin, settings.destination, today, near_end)
     except Exception:
-        log.exception("Ошибка поиска ближайшего прямого рейса MOW->CXR")
-        return "✈️ Не удалось проверить ближайшие прямые рейсы MOW→CXR (ошибка API)\n\n"
+        log.exception("Ошибка поиска ближайшего прямого рейса %s->%s", origin, settings.destination)
+        return f"✈️ Не удалось проверить ближайшие прямые рейсы {origin}→{settings.destination} (ошибка API)\n\n"
     if not candidates:
-        return "✈️ На ближайшие 3 дня прямых билетов MOW→CXR не найдено в кэше Aviasales\n\n"
+        return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{settings.destination} не найдено в кэше Aviasales\n\n"
     best = min(candidates, key=lambda c: c["price"])
     try:
-        meta = await _get_route_metadata("MOW", settings.destination, {best["date"]})
+        meta = await _get_route_metadata(origin, settings.destination, {best["date"]})
     except Exception:
-        log.exception("Ошибка получения метаданных для ближайшего прямого рейса MOW->CXR")
+        log.exception("Ошибка получения метаданных для ближайшего прямого рейса %s->%s", origin, settings.destination)
         meta = {}
-    leg = _make_leg("MOW", settings.destination, best, meta.get(best["date"]))
+    leg = _make_leg(origin, settings.destination, best, meta.get(best["date"]))
     total_family = estimate_total_price(leg.price)
     return (
-        f"✈️ Самый дешёвый прямой MOW→CXR на ближайшие 3 дня: "
+        f"✈️ Самый дешёвый прямой {origin}→{settings.destination} на ближайшие 3 дня: "
         f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ на троих {_baggage_hint(leg.airline)}\n"
         f"{leg.link}\n\n"
     )
@@ -277,17 +278,19 @@ def _apply_direct_priority(options: list[RouteOption]) -> None:
 
 
 async def gather_route_options(start: date, end: date) -> list[RouteOption]:
-    """Прямые варианты и варианты через крупные вьетнамские хабы (config.HUBS)
-    для каждого аэропорта вылета (config.ORIGIN_NAMES / settings.origins),
-    если внутренний перелёт хаб->CXR укладывается в max_domestic_leg_rub.
-    Даты двух ног при варианте через хаб — лучшие в окне поиска по
-    отдельности, а не обязательно стыкующиеся день-в-день: это ориентир,
-    стыковку нужно проверять вручную по ссылкам."""
+    """Прямые варианты для каждого аэропорта вылета (settings.origins), плюс
+    варианты через крупные вьетнамские хабы (config.HUBS), если
+    settings.enable_hub_search включён (имеет смысл только когда
+    destination — Нячанг/Вьетнам) и внутренний перелёт хаб->CXR укладывается
+    в max_domestic_leg_rub. Даты двух ног при варианте через хаб — лучшие в
+    окне поиска по отдельности, а не обязательно стыкующиеся день-в-день:
+    это ориентир, стыковку нужно проверять вручную по ссылкам."""
     tasks = []
     for origin_code in settings.origins:
         tasks.append(_search_direct(origin_code, start, end))
-        for hub_code, hub_name in HUBS.items():
-            tasks.append(_search_via_hub(origin_code, hub_code, hub_name, start, end))
+        if settings.enable_hub_search:
+            for hub_code, hub_name in HUBS.items():
+                tasks.append(_search_via_hub(origin_code, hub_code, hub_name, start, end))
 
     results = await asyncio.gather(*tasks)
     options: list[RouteOption] = [option for group in results for option in group]
@@ -350,9 +353,10 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
                 settings.origins[0], settings.destination, start,
                 settings.adults, settings.children, settings.infants, settings.travelpayouts_marker,
             )
+            hub_note = " (включая варианты через хабы)" if settings.enable_hub_search else ""
             await bot.send_message(
                 chat_id,
-                headline_info + "По этому направлению (включая варианты через хабы) пока нет данных в кэше Aviasales. "
+                headline_info + f"По этому направлению{hub_note} пока нет данных в кэше Aviasales. "
                 f"Проверь вручную:\n{fallback_link}",
             )
         return
@@ -425,21 +429,31 @@ async def cmd_start(message: Message) -> None:
     store.subscribe(message.chat.id)
     budget = budget_for_chat(message.chat.id)
     origins_names = " и ".join(ORIGIN_NAMES.get(o, o) for o in settings.origins)
-    await message.answer(
-        "Привет! Слежу за билетами "
-        f"{'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}, "
-        f"конечная точка всегда Нячанг), в одну сторону, "
-        f"{settings.adults} взрослый + {settings.children} ребёнка, "
+    hub_line = (
         f"{_window_description()} — включая варианты через хабы "
         f"({', '.join(HUBS.values())}): пересадку через хаб показываю впереди прямого, только если "
         f"она реально экономит от ${settings.hub_min_savings_usd:.0f}/чел. (~{settings.hub_min_savings_rub:.0f} ₽ "
         f"по курсу {settings.usd_rub_rate:.0f} ₽/$), иначе показываю прямой рейс.\n"
+        if settings.enable_hub_search
+        else f"{_window_description()}.\n"
+    )
+    mrv_line = (
+        "Отдельно слежу за Минеральными Водами — если по ним появляется что-то стоящее, отмечаю "
+        "отдельной строкой, даже если общий лучший вариант сейчас из Москвы.\n"
+        if "MRV" in settings.origins and len(settings.origins) > 1
+        else ""
+    )
+    await message.answer(
+        "Привет! Слежу за билетами "
+        f"{'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}, "
+        f"конечная точка всегда {settings.destination}), в одну сторону, "
+        f"{settings.adults} взрослый + {settings.children} ребёнка, "
+        f"{hub_line}"
         f"Проверяю раз в {settings.check_interval_minutes} мин. и пишу тебе САМ каждый раз — не нужно "
         "спрашивать вручную. Так видно, как вообще меняются цены на маршруте, а не только моменты "
         "явных распродаж — те дополнительно помечаю значками 🔥 (ниже твоего порога) и 🎯 (заметно "
         "дешевле текущей медианы по рынку).\n"
-        f"Отдельно слежу за Минеральными Водами — если по ним появляется что-то стоящее, отмечаю "
-        "отдельной строкой, даже если общий лучший вариант сейчас из Москвы.\n"
+        f"{mrv_line}"
         f"Порог для отметки 🔥: {budget} ₽/чел. (можно менять через /setbudget).\n\n"
         "Команды:\n"
         "/check — проверить цены прямо сейчас\n"
@@ -473,9 +487,7 @@ async def cmd_setbudget(message: Message, command: CommandObject) -> None:
 async def cmd_status(message: Message) -> None:
     budget = budget_for_chat(message.chat.id)
     origins_names = " и ".join(ORIGIN_NAMES.get(o, o) for o in settings.origins)
-    await message.answer(
-        f"Маршрут: {'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}), "
-        "в одну сторону, конечная точка всегда Нячанг\n"
+    hub_lines = (
         f"Плюс варианты через хабы: {', '.join(f'{name} ({code})' for code, name in HUBS.items())} "
         f"— если внутренний перелёт до {settings.destination} дешевле {settings.max_domestic_leg_rub} ₽\n"
         f"Приоритет прямого рейса: хаб-маршрут показываю впереди прямого, только если экономит от "
@@ -484,6 +496,13 @@ async def cmd_status(message: Message) -> None:
         f"Запас на стыковку через хаб: ≥{settings.min_hub_layover_hours}ч, если время рейсов нашлось "
         f"в календаре Aviasales; если нет — подстраховка минимум {settings.min_hub_layover_days} сутки "
         "(с пометкой ⚠️ в названии варианта)\n"
+        if settings.enable_hub_search
+        else "Поиск через хабы: выключен (ENABLE_HUB_SEARCH=false)\n"
+    )
+    await message.answer(
+        f"Маршрут: {'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}), "
+        f"в одну сторону, конечная точка всегда {settings.destination}\n"
+        f"{hub_lines}"
         f"Багаж: 🧳✅/❌/❓ по типу перевозчика (не по тарифу — сверяй при бронировании)\n"
         f"Окно поиска: {_window_description()}\n"
         f"Пассажиры: {settings.adults} взрослый + {settings.children} ребёнка "
@@ -493,9 +512,9 @@ async def cmd_status(message: Message) -> None:
         f"Порог для отметки 🔥: {budget} ₽/чел.\n"
         f"Отметка 🎯: цена ≤{MARKET_BEATING_RATIO*100:.0f}% от медианы по текущей выдаче — "
         "«заметно дешевле рынка», медиана считается заново на каждой проверке\n"
-        "Минеральные Воды отслеживаются отдельным треком — выгодный вариант оттуда пришлю, "
-        "даже если общий лучший вариант сейчас из Москвы\n"
-        f"Периодичность проверки: раз в {settings.check_interval_minutes} мин."
+        + ("Минеральные Воды отслеживаются отдельным треком — выгодный вариант оттуда пришлю, "
+           "даже если общий лучший вариант сейчас из Москвы\n" if "MRV" in settings.origins and len(settings.origins) > 1 else "")
+        + f"Периодичность проверки: раз в {settings.check_interval_minutes} мин."
     )
 
 

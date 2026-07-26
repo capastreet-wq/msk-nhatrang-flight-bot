@@ -45,7 +45,12 @@ jobs:
           TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
           TRAVELPAYOUTS_MARKER: ${{ secrets.TRAVELPAYOUTS_MARKER }}
           CHECK_INTERVAL_MINUTES: "10"  # держим в согласии с cron выше — это только для текста в /status, на расписание не влияет
-          SEARCH_START_DATE: "2026-08-02"  # конкретная поездка, не скользящее окно — поменяй тут при новой поездке
+          # Билет MOW->CXR на 2 августа 18:40 уже куплен — сейчас ищем только
+          # стыковочный внутренний рейс MRV->MOW, хабы тут не нужны и выключены.
+          ORIGINS: "MRV"
+          DESTINATION: "MOW"
+          ENABLE_HUB_SEARCH: "false"
+          SEARCH_START_DATE: "2026-08-01"  # конкретная поездка, не скользящее окно — поменяй тут при новой поездке
           SEARCH_END_DATE: "2026-08-02"
         run: python run_once.py
 

@@ -50,9 +50,16 @@ class Settings:
     travelpayouts_marker: str | None
 
     origins: tuple[str, ...] = ("MOW", "MRV")  # MOW = все аэропорты Москвы (SVO/DME/VKO) одним кодом; MRV = Минеральные Воды
-    destination: str = "CXR"     # Cam Ranh — аэропорт, обслуживающий Нячанг (всегда конечная точка)
+    destination: str = "CXR"     # Cam Ranh — аэропорт, обслуживающий Нячанг (по умолчанию — конечная точка)
     currency: str = "rub"
     trip_class: int = 0          # 0 = эконом
+
+    # Поиск через вьетнамские хабы (config.HUBS) имеет смысл, только когда
+    # destination — Нячанг/Вьетнам. Для других направлений (например,
+    # внутренний перелёт MRV->MOW, когда билет MOW->CXR уже куплен отдельно)
+    # выключаем — иначе бот попытается искать несуществующие маршруты вида
+    # "MRV -> Хошимин -> Москва".
+    enable_hub_search: bool = True
 
     adults: int = 1
     children: int = 2            # 13 и 17 лет — по тарифам авиакомпаний это "взрослые" места (детский тариф обычно до 12 лет)
@@ -122,6 +129,7 @@ def load_settings() -> Settings:
         origins=tuple(o.strip() for o in os.environ.get("ORIGINS", "MOW,MRV").split(",") if o.strip()),
         destination=os.environ.get("DESTINATION", "CXR"),
         currency=os.environ.get("CURRENCY", "rub"),
+        enable_hub_search=os.environ.get("ENABLE_HUB_SEARCH", "true").strip().lower() not in ("0", "false", "no"),
         search_start_date=date.fromisoformat(raw_start) if raw_start else None,
         search_end_date=date.fromisoformat(raw_end) if raw_end else None,
         search_window_days=int(os.environ.get("SEARCH_WINDOW_DAYS", 21)),
