@@ -321,6 +321,29 @@ Actions — 2000 минут/мес, и из-за того, как cron счит�
 есть с задержкой до `CHECK_INTERVAL_MINUTES`). Проактивные алерты о
 выгодных билетах на это не влияют — работают как раньше.
 
+**Ненадёжность встроенного `schedule`.** GitHub НЕ гарантирует частоту
+cron-триггера — на истории прогонов 02-06.08.2026 при `*/10 * * * *`
+реальные интервалы между срабатываниями были от ~1 часа до 12 часов, а не
+обещанные 10 минут. Для цели "хотя бы пара сообщений в день" этого с
+запасом хватает (даже в худшие дни было больше двух срабатываний), но
+если понадобится по-настоящему частая и предсказуемая доставка — есть
+запасной план ниже.
+
+**Внешний триггер (не настроен, план на будущее).** Вместо встроенного
+`schedule` можно дёргать `workflow_dispatch` через GitHub API из внешнего
+бесплатного cron-сервиса (например, cron-job.org) — исполнение всё равно
+остаётся на GitHub Actions, просто триггер надёжнее. Понадобится:
+1. Fine-grained Personal Access Token на GitHub (Settings → Developer
+   settings → Personal access tokens → Fine-grained tokens), доступ только
+   к этому репозиторию, права Actions → Read and write;
+2. Cronjob на внешнем сервисе: `POST` на
+   `https://api.github.com/repos/capastreet-wq/msk-nhatrang-flight-bot/actions/workflows/check-flights.yml/dispatches`,
+   заголовки `Authorization: Bearer <токен>`, `Accept: application/vnd.github+json`,
+   тело `{"ref":"main"}`.
+
+Не настроено — это только план на случай, если встроенного `schedule`
+когда-нибудь снова станет мало.
+
 **Секреты** (`TELEGRAM_BOT_TOKEN`, `TRAVELPAYOUTS_TOKEN`,
 `TRAVELPAYOUTS_MARKER`) заданы через `gh secret set` — Settings → Secrets
 and variables → Actions в репозитории на GitHub. Права на запись для
