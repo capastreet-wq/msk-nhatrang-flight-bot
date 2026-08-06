@@ -11,9 +11,9 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 
 # Крупные вьетнамские хабы, через которые может быть выгоднее лететь, чем
-# напрямую в CXR: международный перелёт до хаба часто дешевле (больше
-# конкуренции авиакомпаний), а внутренний перелёт хаб -> Нячанг у местных
-# лоукостеров стоит копейки. Код -> человекочитаемое имя для сообщений.
+# напрямую между origins и destinations: один из перелётов (какой именно —
+# зависит от направления, см. bot.py::_search_via_hub) идёт через один из
+# этих городов. Код -> человекочитаемое имя для сообщений.
 HUBS: dict[str, str] = {
     "SGN": "Хошимин",
     "HAN": "Ханой",
@@ -24,6 +24,16 @@ HUBS: dict[str, str] = {
 ORIGIN_NAMES: dict[str, str] = {
     "MOW": "Москвы",
     "MRV": "Минеральных Вод",
+    "CXR": "Нячанга",
+}
+
+# Аэропорты назначения (код -> имя в винительном падеже, для фраз вида "в Москву").
+DESTINATION_NAMES: dict[str, str] = {
+    "MOW": "Москву",
+    "MRV": "Минеральные Воды",
+    "KRR": "Краснодар",
+    "ASF": "Астрахань",
+    "CXR": "Нячанг",
 }
 
 # Багаж в эконом-тарифе по умолчанию — это ОБЩЕЕ ЗНАНИЕ о бизнес-модели
@@ -49,16 +59,19 @@ class Settings:
     travelpayouts_token: str
     travelpayouts_marker: str | None
 
-    origins: tuple[str, ...] = ("MOW", "MRV")  # MOW = все аэропорты Москвы (SVO/DME/VKO) одним кодом; MRV = Минеральные Воды
-    destination: str = "CXR"     # Cam Ranh — аэропорт, обслуживающий Нячанг (по умолчанию — конечная точка)
+    origins: tuple[str, ...] = ("MOW", "MRV")  # обычно один аэропорт вылета на каждое направление, но можно несколько
+    # Города назначения В ПОРЯДКЕ ПРИОРИТЕТА (первый — самый желанный). Если
+    # несколько вариантов оказались в пределах priority_margin_rub друг от
+    # друга по цене — предпочитаем тот, что раньше в этом списке (см.
+    # bot.py::_apply_priority), а не просто самый дешёвый.
+    destinations: tuple[str, ...] = ("CXR",)
     currency: str = "rub"
     trip_class: int = 0          # 0 = эконом
 
     # Поиск через вьетнамские хабы (config.HUBS) имеет смысл, только когда
-    # destination — Нячанг/Вьетнам. Для других направлений (например,
-    # внутренний перелёт MRV->MOW, когда билет MOW->CXR уже куплен отдельно)
-    # выключаем — иначе бот попытается искать несуществующие маршруты вида
-    # "MRV -> Хошимин -> Москва".
+    # маршрут связан с Вьетнамом. Для остальных направлений (например,
+    # внутренний перелёт MRV->MOW) выключаем — иначе бот попытается искать
+    # несуществующие маршруты вида "MRV -> Хошимин -> Москва".
     enable_hub_search: bool = True
 
     # Все трое считаются взрослыми пассажирами: детям 13 и 17 лет, а детский
@@ -79,28 +92,35 @@ class Settings:
     search_end_date: date | None = None
     search_window_days: int = 21
 
+    # На сколько дней ДАЛЬШЕ основного окна поиска (search_end_date/
+    # search_window_days) фоново забираем цены — ТОЛЬКО чтобы посчитать
+    # медиану рынка (market_stats) на более широкой выборке, эти даты НЕ
+    # показываются как варианты для покупки. Нужно, чтобы понимать, дорого
+    # или дёшево сейчас в пределах основного окна относительно чуть более
+    # длинного горизонта.
+    market_context_extra_days: int = 10
+
     check_interval_minutes: int = 20
     default_budget_rub: int = 30_000  # порог для отметки 🔥 — за ОДНОГО человека (сравнивается с ценой за взрослого, не с суммой на всю компанию)
-    max_domestic_leg_rub: int = 8_000  # маршрут через хаб учитываем, только если внутренний перелёт до CXR дешевле этого
+    max_domestic_leg_rub: int = 8_000  # внутренний перелёт по Вьетнаму (нога хаб-маршрута) учитываем, только если дешевле этого
 
-    # Хаб-маршрут (через SGN/HAN/DAD) показываем/ставим впереди прямого,
-    # только если он реально экономит от hub_min_savings_usd на человека —
-    # иначе показываем прямой рейс, даже если хаб чуть дешевле. usd_rub_rate
-    # даёт перевод в рубли для сравнения с ценами Data API (те всегда в
-    # рублях) — курс приблизительный (ЦБ на 25.07.2026 ~78 ₽/$), обновляй
-    # вручную при сильных колебаниях, точность до рубля тут не нужна.
-    hub_min_savings_usd: float = 100.0
-    usd_rub_rate: float = 78.0
+    # Единый порог "почти одинаковая цена — выбираем по приоритету, а не по
+    # минимальной цене" (bot.py::_apply_priority). Применяется в двух местах:
+    # 1) прямой рейс vs рейс через хаб — прямой предпочитаем, если он дороже
+    #    самого дешёвого варианта не больше чем на эту сумму на человека;
+    # 2) выбор между несколькими городами назначения (destinations) — более
+    #    приоритетный (раньше в списке) город предпочитаем на тех же условиях.
+    priority_margin_rub: float = 10_000.0
 
     # v2/prices/latest (источник цен) не отдаёт время рейсов, но v1/prices/
     # calendar отдаёт departure_at по датам для большинства маршрутов (кроме
-    # цены — та ненадёжна для MOW-CXR, см. travelpayouts.py). Поэтому для
-    # рейсов через хаб бот пробует посчитать реальный запас в часах между
-    # прилётом (departure_at международного рейса + duration) и вылетом
-    # внутреннего рейса; если время найдено — требует min_hub_layover_hours.
-    # Если по какой-то дате время не нашлось в календаре — используется
-    # запасной вариант: минимум min_hub_layover_days суток (и такой вариант
-    # явно помечается в сообщении как неподтверждённый по времени).
+    # цены — та ненадёжна для отдельных редких пар, см. travelpayouts.py).
+    # Поэтому для рейсов через хаб бот пробует посчитать реальный запас в
+    # часах между прилётом первой ноги (departure_at + duration) и вылетом
+    # второй; если время найдено — требует min_hub_layover_hours. Если по
+    # какой-то дате время не нашлось в календаре — используется запасной
+    # вариант: минимум min_hub_layover_days суток (и такой вариант явно
+    # помечается в сообщении как неподтверждённый по времени).
     min_hub_layover_hours: int = 6
     min_hub_layover_days: int = 1
     max_hub_layover_days: int = 3
@@ -110,10 +130,6 @@ class Settings:
     @property
     def total_passengers(self) -> int:
         return self.adults + self.children
-
-    @property
-    def hub_min_savings_rub(self) -> float:
-        return self.hub_min_savings_usd * self.usd_rub_rate
 
 
 def load_settings() -> Settings:
@@ -132,7 +148,7 @@ def load_settings() -> Settings:
         travelpayouts_token=travelpayouts_token,
         travelpayouts_marker=os.environ.get("TRAVELPAYOUTS_MARKER") or None,
         origins=tuple(o.strip() for o in os.environ.get("ORIGINS", "MOW,MRV").split(",") if o.strip()),
-        destination=os.environ.get("DESTINATION", "CXR"),
+        destinations=tuple(d.strip() for d in os.environ.get("DESTINATIONS", "CXR").split(",") if d.strip()),
         currency=os.environ.get("CURRENCY", "rub"),
         enable_hub_search=os.environ.get("ENABLE_HUB_SEARCH", "true").strip().lower() not in ("0", "false", "no"),
         search_start_date=date.fromisoformat(raw_start) if raw_start else None,
@@ -141,8 +157,8 @@ def load_settings() -> Settings:
         check_interval_minutes=int(os.environ.get("CHECK_INTERVAL_MINUTES", 20)),
         default_budget_rub=int(os.environ.get("DEFAULT_BUDGET_RUB", 30_000)),
         max_domestic_leg_rub=int(os.environ.get("MAX_DOMESTIC_LEG_RUB", 8_000)),
-        hub_min_savings_usd=float(os.environ.get("HUB_MIN_SAVINGS_USD", 100.0)),
-        usd_rub_rate=float(os.environ.get("USD_RUB_RATE", 78.0)),
+        priority_margin_rub=float(os.environ.get("PRIORITY_MARGIN_RUB", 10_000.0)),
+        market_context_extra_days=int(os.environ.get("MARKET_CONTEXT_EXTRA_DAYS", 10)),
         min_hub_layover_hours=int(os.environ.get("MIN_HUB_LAYOVER_HOURS", 6)),
         min_hub_layover_days=int(os.environ.get("MIN_HUB_LAYOVER_DAYS", 1)),
         max_hub_layover_days=int(os.environ.get("MAX_HUB_LAYOVER_DAYS", 3)),

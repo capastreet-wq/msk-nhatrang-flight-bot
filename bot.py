@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import AIRLINE_BAGGAGE_INCLUDED, HUBS, ORIGIN_NAMES, Settings, load_settings
+from config import AIRLINE_BAGGAGE_INCLUDED, DESTINATION_NAMES, HUBS, ORIGIN_NAMES, Settings, load_settings
 from storage import Store
 from travelpayouts import TravelpayoutsClient, build_booking_link, get_cheapest_in_window, months_between
 
@@ -26,6 +26,8 @@ store = Store(settings.data_dir / "state.json")
 bot = Bot(token=settings.telegram_token, default=DefaultBotProperties(parse_mode=None))
 dp = Dispatcher()
 tp_client = TravelpayoutsClient(settings.travelpayouts_token, settings.currency)
+
+_VIETNAM_AIRPORTS = frozenset({"CXR", *HUBS.keys()})  # для определения, какая нога хаб-маршрута внутренняя, а какая международная
 
 ALERT_MEANINGFUL_DROP = 0.97  # в заголовке отмечаем "цена упала", если ниже последней увиденной минимум на 3%
 MARKET_BEATING_RATIO = 0.85   # цена <= 85% медианы по текущей выдаче — считаем "заметно дешевле рынка"
@@ -119,23 +121,24 @@ async def _get_route_metadata(origin: str, destination: str, dates: set) -> dict
     return {d: merged[d.isoformat()] for d in dates if d.isoformat() in merged}
 
 
-async def _search_direct(origin_code: str, start: date, end: date) -> list[RouteOption]:
+async def _search_direct(origin_code: str, destination_code: str, start: date, end: date) -> list[RouteOption]:
     try:
-        direct = await get_cheapest_in_window(tp_client, origin_code, settings.destination, start, end)
+        direct = await get_cheapest_in_window(tp_client, origin_code, destination_code, start, end)
     except Exception:
-        log.exception("Ошибка поиска прямого варианта %s -> %s", origin_code, settings.destination)
+        log.exception("Ошибка поиска прямого варианта %s -> %s", origin_code, destination_code)
         return []
     candidates = direct[:3]
     try:
-        meta_by_date = await _get_route_metadata(origin_code, settings.destination, {c["date"] for c in candidates})
+        meta_by_date = await _get_route_metadata(origin_code, destination_code, {c["date"] for c in candidates})
     except Exception:
-        log.exception("Ошибка получения метаданных %s -> %s", origin_code, settings.destination)
+        log.exception("Ошибка получения метаданных %s -> %s", origin_code, destination_code)
         meta_by_date = {}
     origin_name = ORIGIN_NAMES.get(origin_code, origin_code)
+    destination_name = DESTINATION_NAMES.get(destination_code, destination_code)
     options = []
     for item in candidates:
-        leg = _make_leg(origin_code, settings.destination, item, meta_by_date.get(item["date"]))
-        options.append(RouteOption(total_price=leg.price, legs=[leg], label=f"Прямой из {origin_name}"))
+        leg = _make_leg(origin_code, destination_code, item, meta_by_date.get(item["date"]))
+        options.append(RouteOption(total_price=leg.price, legs=[leg], label=f"Прямой из {origin_name} в {destination_name}"))
     return options
 
 
@@ -143,106 +146,130 @@ async def _cheapest_direct_headline() -> str:
     """Первая строка каждого сообщения: самый дешёвый прямой билет (один
     билет, без сборки через хаб — то же значение "прямой", что и у остальных
     RouteOption с label "Прямой из ...") по первому аэропорту вылета
-    (settings.origins[0]) на ближайшие 3 дня. Отдельный, более узкий поиск
-    от основного окна (settings.search_start_date/end) — под наблюдение,
-    что горящие предложения появляются за пару-тройку дней до вылета."""
+    (settings.origins[0]) и самому приоритетному городу назначения
+    (settings.destinations[0]) на ближайшие 3 дня. Отдельный, более узкий
+    поиск от основного окна (settings.search_start_date/end) — под
+    наблюдение, что горящие предложения появляются за пару-тройку дней до
+    вылета."""
     origin = settings.origins[0]
+    destination = settings.destinations[0]
     today = date.today()
     near_end = today + timedelta(days=3)
     try:
-        candidates = await get_cheapest_in_window(tp_client, origin, settings.destination, today, near_end)
+        candidates = await get_cheapest_in_window(tp_client, origin, destination, today, near_end)
     except Exception:
-        log.exception("Ошибка поиска ближайшего прямого рейса %s->%s", origin, settings.destination)
-        return f"✈️ Не удалось проверить ближайшие прямые рейсы {origin}→{settings.destination} (ошибка API)\n\n"
+        log.exception("Ошибка поиска ближайшего прямого рейса %s->%s", origin, destination)
+        return f"✈️ Не удалось проверить ближайшие прямые рейсы {origin}→{destination} (ошибка API)\n\n"
     if not candidates:
-        return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{settings.destination} не найдено в кэше Aviasales\n\n"
+        return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{destination} не найдено в кэше Aviasales\n\n"
     best = min(candidates, key=lambda c: c["price"])
     try:
-        meta = await _get_route_metadata(origin, settings.destination, {best["date"]})
+        meta = await _get_route_metadata(origin, destination, {best["date"]})
     except Exception:
-        log.exception("Ошибка получения метаданных для ближайшего прямого рейса %s->%s", origin, settings.destination)
+        log.exception("Ошибка получения метаданных для ближайшего прямого рейса %s->%s", origin, destination)
         meta = {}
-    leg = _make_leg(origin, settings.destination, best, meta.get(best["date"]))
+    leg = _make_leg(origin, destination, best, meta.get(best["date"]))
     total_family = estimate_total_price(leg.price)
     return (
-        f"✈️ Самый дешёвый прямой {origin}→{settings.destination} на ближайшие 3 дня: "
+        f"✈️ Самый дешёвый прямой {origin}→{destination} на ближайшие 3 дня: "
         f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()} {_baggage_hint(leg.airline)}\n"
         f"{leg.link}\n\n"
     )
 
 
-async def _search_via_hub(origin_code: str, hub_code: str, hub_name: str, start: date, end: date) -> list[RouteOption]:
-    """Подбирает пару билетов origin->hub и hub->CXR с реальным запасом на
-    пересадку. v1/prices/calendar отдаёт время вылета (departure_at) для
-    большинства маршрутов — используем его вместе с длительностью рейса
-    (duration из v2/prices/latest), чтобы оценить время прилёта в хаб и
-    сравнить с временем вылета внутреннего рейса. Если для какой-то даты
-    время не нашлось — используем запасной вариант: минимум
+async def _search_via_hub(
+    origin_code: str, hub_code: str, hub_name: str, destination_code: str, start: date, end: date,
+) -> list[RouteOption]:
+    """Подбирает пару билетов origin->hub (leg_a) и hub->destination (leg_b)
+    с реальным запасом на пересадку. v1/prices/calendar отдаёт время вылета
+    (departure_at) для большинства маршрутов — используем его вместе с
+    длительностью рейса (duration из v2/prices/latest), чтобы оценить время
+    прилёта в хаб и сравнить с временем вылета второй ноги. Если для
+    какой-то даты время не нашлось — используем запасной вариант: минимум
     min_hub_layover_days суток, с явной пометкой в названии варианта, что
     время не подтверждено.
 
-    Ногу origin->hub учитываем, ТОЛЬКО если это прямой рейс (number_of_changes
-    == 0 в сырых данных v2/prices/latest) — иначе это уже две пересадки на
-    пути в Нячанг (по пути к хабу + сам хаб->CXR), а не одна, и оправдать
-    это сложнее даже при экономии в $100+."""
+    Какая из двух ног — "длинная международная" (только прямой рейс,
+    number_of_changes == 0), а какая "короткая внутренняя по Вьетнаму"
+    (ограничена по цене max_domestic_leg_rub) — зависит от того, откуда
+    летим: если origin_code сам в HUBS/Вьетнаме (обратный маршрут Вьетнам->
+    Россия) — внутренняя нога первая (origin->hub), международная вторая
+    (hub->destination); если origin_code — российский город (обычный
+    маршрут в Нячанг) — наоборот, международная первая, внутренняя вторая.
+    В обоих случаях именно "длинную" ногу требуем прямой — не стоит
+    стыковать с ещё одной пересадкой уже пересадочный международный рейс."""
+    leg_a_is_domestic = origin_code in _VIETNAM_AIRPORTS  # origin уже во Вьетнаме — первая нога внутренняя
     dom_end = end + timedelta(days=settings.max_hub_layover_days)
     try:
-        intl, dom = await asyncio.gather(
+        leg_a_all, leg_b_all = await asyncio.gather(
             get_cheapest_in_window(tp_client, origin_code, hub_code, start, end),
-            get_cheapest_in_window(tp_client, hub_code, settings.destination, start, dom_end),
+            get_cheapest_in_window(tp_client, hub_code, destination_code, start, dom_end),
         )
     except Exception:
-        log.exception("Ошибка поиска через хаб %s из %s", hub_code, origin_code)
+        log.exception("Ошибка поиска через хаб %s (%s -> %s)", hub_code, origin_code, destination_code)
         return []
-    if not intl or not dom:
+    if not leg_a_all or not leg_b_all:
         return []
 
-    intl_candidates = [c for c in intl if (c.get("raw") or {}).get("number_of_changes") == 0][:5]
-    if not intl_candidates:
+    if leg_a_is_domestic:
+        leg_a_candidates = [c for c in leg_a_all if c["price"] <= settings.max_domestic_leg_rub][:5]
+        leg_b_direct_only = [c for c in leg_b_all if (c.get("raw") or {}).get("number_of_changes") == 0]
+    else:
+        leg_a_candidates = [c for c in leg_a_all if (c.get("raw") or {}).get("number_of_changes") == 0][:5]
+        leg_b_direct_only = None  # leg_b — внутренняя, ценовой фильтр применяем позже по max_domestic_leg_rub
+
+    if not leg_a_candidates:
         return []
-    intl_dates = {c["date"] for c in intl_candidates}
-    dom_dates_needed = {
+    leg_b_pool = leg_b_direct_only if leg_b_direct_only is not None else leg_b_all
+    if not leg_b_pool:
+        return []
+    leg_b_by_date = {c["date"]: c for c in leg_b_pool}
+
+    leg_a_dates = {c["date"] for c in leg_a_candidates}
+    leg_b_dates_needed = {
         c["date"] + timedelta(days=delta)
-        for c in intl_candidates
+        for c in leg_a_candidates
         for delta in range(0, settings.max_hub_layover_days + 1)
     }
     try:
-        intl_meta, dom_meta = await asyncio.gather(
-            _get_route_metadata(origin_code, hub_code, intl_dates),
-            _get_route_metadata(hub_code, settings.destination, dom_dates_needed),
+        leg_a_meta, leg_b_meta = await asyncio.gather(
+            _get_route_metadata(origin_code, hub_code, leg_a_dates),
+            _get_route_metadata(hub_code, destination_code, leg_b_dates_needed),
         )
     except Exception:
-        log.exception("Ошибка получения метаданных для хаба %s из %s", hub_code, origin_code)
-        intl_meta, dom_meta = {}, {}
+        log.exception("Ошибка получения метаданных для хаба %s (%s -> %s)", hub_code, origin_code, destination_code)
+        leg_a_meta, leg_b_meta = {}, {}
 
-    dom_by_date = {d["date"]: d for d in dom}
     origin_name = ORIGIN_NAMES.get(origin_code, origin_code)
+    destination_name = DESTINATION_NAMES.get(destination_code, destination_code)
 
-    for intl_item in intl_candidates:
-        arrival_date = intl_item["date"]
-        intl_info = intl_meta.get(arrival_date)
-        intl_departure_at = intl_info.get("departure_at") if intl_info else None
-        duration_min = (intl_item.get("raw") or {}).get("duration")
+    for leg_a_item in leg_a_candidates:
+        arrival_date = leg_a_item["date"]
+        leg_a_info = leg_a_meta.get(arrival_date)
+        leg_a_departure_at = leg_a_info.get("departure_at") if leg_a_info else None
+        duration_min = (leg_a_item.get("raw") or {}).get("duration")
         arrival_estimate = (
-            intl_departure_at + timedelta(minutes=duration_min)
-            if intl_departure_at and duration_min else None
+            leg_a_departure_at + timedelta(minutes=duration_min)
+            if leg_a_departure_at and duration_min else None
         )
 
         verified: list[tuple[float, dict, dict | None]] = []
         fallback: list[tuple[float, dict, dict | None]] = []
         for delta in range(0, settings.max_hub_layover_days + 1):
             cand_date = arrival_date + timedelta(days=delta)
-            dom_item = dom_by_date.get(cand_date)
-            if not dom_item or dom_item["price"] > settings.max_domestic_leg_rub:
+            leg_b_item = leg_b_by_date.get(cand_date)
+            if not leg_b_item:
                 continue
-            dom_info = dom_meta.get(cand_date)
-            dom_departure_at = dom_info.get("departure_at") if dom_info else None
-            if arrival_estimate and dom_departure_at:
-                gap_hours = (dom_departure_at - arrival_estimate).total_seconds() / 3600
+            if leg_b_direct_only is None and leg_b_item["price"] > settings.max_domestic_leg_rub:
+                continue
+            leg_b_info = leg_b_meta.get(cand_date)
+            leg_b_departure_at = leg_b_info.get("departure_at") if leg_b_info else None
+            if arrival_estimate and leg_b_departure_at:
+                gap_hours = (leg_b_departure_at - arrival_estimate).total_seconds() / 3600
                 if gap_hours >= settings.min_hub_layover_hours:
-                    verified.append((dom_item["price"], dom_item, dom_info))
+                    verified.append((leg_b_item["price"], leg_b_item, leg_b_info))
             elif delta >= settings.min_hub_layover_days:
-                fallback.append((dom_item["price"], dom_item, dom_info))
+                fallback.append((leg_b_item["price"], leg_b_item, leg_b_info))
 
         chosen, chosen_info, time_verified = None, None, False
         if verified:
@@ -253,58 +280,71 @@ async def _search_via_hub(origin_code: str, hub_code: str, hub_name: str, start:
 
         if chosen is None:
             continue
-        intl_leg = _make_leg(origin_code, hub_code, intl_item, intl_info)
-        dom_leg = _make_leg(hub_code, settings.destination, chosen, chosen_info)
-        label = f"Из {origin_name} через {hub_name} ({hub_code})"
+        leg_a_leg = _make_leg(origin_code, hub_code, leg_a_item, leg_a_info)
+        leg_b_leg = _make_leg(hub_code, destination_code, chosen, chosen_info)
+        label = f"Из {origin_name} через {hub_name} ({hub_code}) в {destination_name}"
         if not time_verified:
             label += f" ⚠️ время рейсов не найдено, стыковка ≥{settings.min_hub_layover_days} сут. для подстраховки"
         return [RouteOption(
-            total_price=intl_leg.price + dom_leg.price,
-            legs=[intl_leg, dom_leg],
+            total_price=leg_a_leg.price + leg_b_leg.price,
+            legs=[leg_a_leg, leg_b_leg],
             label=label,
         )]
     return []
 
 
-def _apply_direct_priority(options: list[RouteOption]) -> None:
-    """Прямой перелёт (1 нога, сразу до Нячанга) ставим первым, если он
-    дороже самого дешёвого варианта не больше чем на hub_min_savings_rub
-    (по умолчанию $100/чел. по курсу settings.usd_rub_rate) — пересадка
-    через хаб того стоит, только если реально экономит эту сумму на
-    человека, иначе не городим лишний билет и риск стыковки ради мелочи."""
+def _apply_priority(options: list[RouteOption]) -> None:
+    """Среди вариантов, что укладываются в priority_margin_rub от самого
+    дешёвого (по умолчанию 10 000 ₽/чел.), выбираем не просто дешевейший, а
+    более ПРИОРИТЕТНЫЙ по двум признакам (в таком порядке): 1) прямой рейс
+    (1 нога) предпочтительнее рейса через хаб (2 ноги) — реже пересадка,
+    меньше риска; 2) город назначения — чем раньше в settings.destinations,
+    тем приоритетнее. Экономия в пределах порога не стоит того, чтобы
+    жертвовать простотой маршрута или предпочитаемым городом прилёта."""
     if not options:
         return
     cheapest_price = options[0].total_price
-    direct_options = [o for o in options if len(o.legs) == 1]
-    if not direct_options:
+
+    def _preference(option: RouteOption) -> tuple[int, int]:
+        is_via_hub = 1 if len(option.legs) > 1 else 0
+        destination_code = option.legs[-1].destination
+        destination_rank = (
+            settings.destinations.index(destination_code)
+            if destination_code in settings.destinations
+            else len(settings.destinations)
+        )
+        return (is_via_hub, destination_rank)
+
+    close_enough = [o for o in options if o.total_price - cheapest_price <= settings.priority_margin_rub]
+    if not close_enough:
         return
-    best_direct = min(direct_options, key=lambda o: o.total_price)
-    if best_direct is options[0]:
+    most_preferred = min(close_enough, key=_preference)
+    if most_preferred is options[0]:
         return
-    if best_direct.total_price - cheapest_price <= settings.hub_min_savings_rub:
-        options.remove(best_direct)
-        options.insert(0, best_direct)
+    options.remove(most_preferred)
+    options.insert(0, most_preferred)
 
 
 async def gather_route_options(start: date, end: date) -> list[RouteOption]:
-    """Прямые варианты для каждого аэропорта вылета (settings.origins), плюс
-    варианты через крупные вьетнамские хабы (config.HUBS), если
-    settings.enable_hub_search включён (имеет смысл только когда
-    destination — Нячанг/Вьетнам) и внутренний перелёт хаб->CXR укладывается
-    в max_domestic_leg_rub. Даты двух ног при варианте через хаб — лучшие в
-    окне поиска по отдельности, а не обязательно стыкующиеся день-в-день:
-    это ориентир, стыковку нужно проверять вручную по ссылкам."""
+    """Прямые варианты для каждой пары (аэропорт вылета из settings.origins,
+    город назначения из settings.destinations), плюс варианты через крупные
+    вьетнамские хабы (config.HUBS), если settings.enable_hub_search включён
+    (имеет смысл только когда маршрут связан с Вьетнамом) и внутренняя нога
+    укладывается в max_domestic_leg_rub. Даты двух ног при варианте через
+    хаб — лучшие в окне поиска по отдельности, а не обязательно
+    стыкующиеся день-в-день: это ориентир, стыковку нужно проверять вручную
+    по ссылкам."""
     tasks = []
     for origin_code in settings.origins:
-        tasks.append(_search_direct(origin_code, start, end))
-        if settings.enable_hub_search:
-            for hub_code, hub_name in HUBS.items():
-                tasks.append(_search_via_hub(origin_code, hub_code, hub_name, start, end))
+        for destination_code in settings.destinations:
+            tasks.append(_search_direct(origin_code, destination_code, start, end))
+            if settings.enable_hub_search:
+                for hub_code, hub_name in HUBS.items():
+                    tasks.append(_search_via_hub(origin_code, hub_code, hub_name, destination_code, start, end))
 
     results = await asyncio.gather(*tasks)
     options: list[RouteOption] = [option for group in results for option in group]
     options.sort(key=lambda o: o.total_price)
-    _apply_direct_priority(options)
     return options
 
 
@@ -346,20 +386,30 @@ def _search_window() -> tuple[date, date]:
 
 async def run_search(chat_id: int, *, force_reply: bool) -> None:
     start, window_end = _search_window()
+    context_end = window_end + timedelta(days=settings.market_context_extra_days)
     headline_info = await _cheapest_direct_headline()  # первая информация в любом сообщении, всегда
 
     try:
-        options = await gather_route_options(start, window_end)
+        # Забираем сразу расширенное окно (+market_context_extra_days) одним
+        # запросом — оно нужно ТОЛЬКО для медианы рынка (market_stats ниже),
+        # даты за пределами window_end как варианты для покупки не показываем
+        # (см. фильтр options ниже) — "фоново мониторим, но не предлагаем".
+        all_options = await gather_route_options(start, context_end)
     except Exception:
         log.exception("Ошибка запроса к Travelpayouts для чата %s", chat_id)
         if force_reply:
             await bot.send_message(chat_id, headline_info + "Не удалось получить данные от Travelpayouts, попробуй позже.")
         return
 
+    median_price, sample_size = market_stats(all_options)
+    options = [o for o in all_options if o.legs[0].date <= window_end]
+    options.sort(key=lambda o: o.total_price)
+    _apply_priority(options)
+
     if not options:
         if force_reply:
             fallback_link = build_booking_link(
-                settings.origins[0], settings.destination, start,
+                settings.origins[0], settings.destinations[0], start,
                 settings.adults, settings.children, settings.infants, settings.travelpayouts_marker,
             )
             hub_note = " (включая варианты через хабы)" if settings.enable_hub_search else ""
@@ -373,7 +423,6 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
     best = options[0]
     total_estimate = estimate_total_price(best.total_price)
     budget = budget_for_chat(chat_id)
-    median_price, sample_size = market_stats(options)
 
     def _deal_tags(option: RouteOption) -> list[str]:
         tags = []
@@ -386,23 +435,30 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
 
     overall_tags = _deal_tags(best)
 
-    mrv_options = [o for o in options if o.legs[0].origin == "MRV"]
-    best_mrv = mrv_options[0] if mrv_options else None
-    mrv_total_estimate = estimate_total_price(best_mrv.total_price) if best_mrv else None
-    mrv_tags = _deal_tags(best_mrv) if best_mrv else []
+    # Самый приоритетный город назначения (settings.destinations[0]) может не
+    # попасть в топ-5 по цене, если он ощутимо (больше priority_margin_rub)
+    # дороже остальных — показываем его отдельным блоком, чтобы не терялся.
+    top_priority_destination = settings.destinations[0]
+    priority_options = [o for o in options if o.legs[-1].destination == top_priority_destination]
+    best_priority = priority_options[0] if priority_options else None
+    priority_total_estimate = estimate_total_price(best_priority.total_price) if best_priority else None
+    priority_tags = _deal_tags(best_priority) if best_priority else []
 
     top_shown = options[:5]
-    body = headline_info + f"{'/'.join(settings.origins)} → {settings.destination}, в одну сторону:\n\n{format_results(options)}"
-    if best_mrv and best_mrv not in top_shown:
-        body += f"\n\nОтдельно из Минеральных Вод:\n{format_option(best_mrv)}"
+    body = headline_info + (
+        f"{'/'.join(settings.origins)} → {'/'.join(settings.destinations)}, в одну сторону:\n\n{format_results(options)}"
+    )
+    if best_priority and best_priority not in top_shown:
+        priority_name = DESTINATION_NAMES.get(top_priority_destination, top_priority_destination)
+        body += f"\n\nОтдельно в {priority_name} (приоритетный город прилёта):\n{format_option(best_priority)}"
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if force_reply:
         await bot.send_message(chat_id, body)
         store.update_alert_state(chat_id, total_estimate, now_iso)
-        if best_mrv:
-            store.update_alert_state(chat_id, mrv_total_estimate, now_iso, prefix="mrv_alert")
+        if best_priority:
+            store.update_alert_state(chat_id, priority_total_estimate, now_iso, prefix="priority_alert")
         return
 
     # Плановая проверка шлёт сообщение КАЖДЫЙ РАЗ, не только когда выгодно —
@@ -418,13 +474,14 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
         headline = "📊 Текущие цены:"
     if overall_tags:
         headline += "\n" + "\n".join(overall_tags)
-    if mrv_tags:
-        headline += "\nИз Минеральных Вод: " + ", ".join(mrv_tags)
+    if priority_tags:
+        priority_name = DESTINATION_NAMES.get(top_priority_destination, top_priority_destination)
+        headline += f"\nВ {priority_name}: " + ", ".join(priority_tags)
 
     await bot.send_message(chat_id, f"{headline}\n\n{body}")
     store.update_alert_state(chat_id, total_estimate, now_iso)
-    if best_mrv:
-        store.update_alert_state(chat_id, mrv_total_estimate, now_iso, prefix="mrv_alert")
+    if best_priority:
+        store.update_alert_state(chat_id, priority_total_estimate, now_iso, prefix="priority_alert")
 
 
 def _window_description() -> str:
@@ -457,31 +514,34 @@ async def cmd_start(message: Message) -> None:
     store.subscribe(message.chat.id)
     budget = budget_for_chat(message.chat.id)
     origins_names = " и ".join(ORIGIN_NAMES.get(o, o) for o in settings.origins)
+    destinations_names = " > ".join(DESTINATION_NAMES.get(d, d) for d in settings.destinations)
     hub_line = (
         f"{_window_description()} — включая варианты через хабы "
-        f"({', '.join(HUBS.values())}): пересадку через хаб показываю впереди прямого, только если "
-        f"она реально экономит от ${settings.hub_min_savings_usd:.0f}/чел. (~{settings.hub_min_savings_rub:.0f} ₽ "
-        f"по курсу {settings.usd_rub_rate:.0f} ₽/$), иначе показываю прямой рейс.\n"
+        f"({', '.join(HUBS.values())}): прямой рейс показываю впереди рейса через хаб, только если "
+        f"экономия от пересадки не больше {settings.priority_margin_rub:.0f} ₽/чел., иначе показываю "
+        "маршрут через хаб.\n"
         if settings.enable_hub_search
         else f"{_window_description()}.\n"
     )
-    mrv_line = (
-        "Отдельно слежу за Минеральными Водами — если по ним появляется что-то стоящее, отмечаю "
-        "отдельной строкой, даже если общий лучший вариант сейчас из Москвы.\n"
-        if "MRV" in settings.origins and len(settings.origins) > 1
+    destinations_line = (
+        f"Города прилёта — по приоритету: {destinations_names}. Если разница между ними не больше "
+        f"{settings.priority_margin_rub:.0f} ₽/чел. — предпочитаю более приоритетный, а не просто самый "
+        "дешёвый; если приоритетный ощутимо дороже, отмечаю его отдельной строкой, даже если он не "
+        "попал в топ по цене.\n"
+        if len(settings.destinations) > 1
         else ""
     )
     await message.answer(
         "Привет! Слежу за билетами "
-        f"{'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}, "
-        f"конечная точка всегда {settings.destination}), в одну сторону, "
+        f"{'/'.join(settings.origins)} → {'/'.join(settings.destinations)} (вылет из {origins_names}), "
+        f"в одну сторону, "
         f"{_passengers_description()}, "
         f"{hub_line}"
         f"Проверяю раз в {settings.check_interval_minutes} мин. и пишу тебе САМ каждый раз — не нужно "
         "спрашивать вручную. Так видно, как вообще меняются цены на маршруте, а не только моменты "
         "явных распродаж — те дополнительно помечаю значками 🔥 (ниже твоего порога) и 🎯 (заметно "
         "дешевле текущей медианы по рынку).\n"
-        f"{mrv_line}"
+        f"{destinations_line}"
         f"Порог для отметки 🔥: {budget} ₽/чел. (можно менять через /setbudget).\n\n"
         "Команды:\n"
         "/check — проверить цены прямо сейчас\n"
@@ -515,21 +575,28 @@ async def cmd_setbudget(message: Message, command: CommandObject) -> None:
 async def cmd_status(message: Message) -> None:
     budget = budget_for_chat(message.chat.id)
     origins_names = " и ".join(ORIGIN_NAMES.get(o, o) for o in settings.origins)
+    destinations_names = " > ".join(DESTINATION_NAMES.get(d, d) for d in settings.destinations)
     hub_lines = (
         f"Плюс варианты через хабы: {', '.join(f'{name} ({code})' for code, name in HUBS.items())} "
-        f"— если внутренний перелёт до {settings.destination} дешевле {settings.max_domestic_leg_rub} ₽\n"
-        f"Приоритет прямого рейса: хаб-маршрут показываю впереди прямого, только если экономит от "
-        f"${settings.hub_min_savings_usd:.0f}/чел. (~{settings.hub_min_savings_rub:.0f} ₽ по курсу "
-        f"{settings.usd_rub_rate:.0f} ₽/$) — иначе показываю прямой\n"
+        f"— если внутренняя (по Вьетнаму) нога маршрута дешевле {settings.max_domestic_leg_rub} ₽\n"
+        f"Приоритет прямого рейса: хаб-маршрут показываю впереди прямого, только если экономит больше "
+        f"{settings.priority_margin_rub:.0f} ₽/чел. — иначе показываю прямой\n"
         f"Запас на стыковку через хаб: ≥{settings.min_hub_layover_hours}ч, если время рейсов нашлось "
         f"в календаре Aviasales; если нет — подстраховка минимум {settings.min_hub_layover_days} сутки "
         "(с пометкой ⚠️ в названии варианта)\n"
         if settings.enable_hub_search
         else "Поиск через хабы: выключен (ENABLE_HUB_SEARCH=false)\n"
     )
+    destinations_line = (
+        f"Города прилёта по приоритету: {destinations_names} — разница до "
+        f"{settings.priority_margin_rub:.0f} ₽/чел. не в счёт, предпочитаю более приоритетный\n"
+        if len(settings.destinations) > 1
+        else ""
+    )
     await message.answer(
-        f"Маршрут: {'/'.join(settings.origins)} → {settings.destination} (вылет из {origins_names}), "
-        f"в одну сторону, конечная точка всегда {settings.destination}\n"
+        f"Маршрут: {'/'.join(settings.origins)} → {'/'.join(settings.destinations)} (вылет из {origins_names}), "
+        "в одну сторону\n"
+        f"{destinations_line}"
         f"{hub_lines}"
         f"Багаж: 🧳✅/❌/❓ по типу перевозчика (не по тарифу — сверяй при бронировании)\n"
         f"Окно поиска: {_window_description()}\n"
@@ -540,8 +607,9 @@ async def cmd_status(message: Message) -> None:
         f"Порог для отметки 🔥: {budget} ₽/чел.\n"
         f"Отметка 🎯: цена ≤{MARKET_BEATING_RATIO*100:.0f}% от медианы по текущей выдаче — "
         "«заметно дешевле рынка», медиана считается заново на каждой проверке\n"
-        + ("Минеральные Воды отслеживаются отдельным треком — выгодный вариант оттуда пришлю, "
-           "даже если общий лучший вариант сейчас из Москвы\n" if "MRV" in settings.origins and len(settings.origins) > 1 else "")
+        + (f"Приоритетный город прилёта ({DESTINATION_NAMES.get(settings.destinations[0], settings.destinations[0])}) "
+           "отслеживается отдельным треком — выгодный вариант по нему пришлю, даже если общий лучший "
+           "вариант сейчас в другой город\n" if len(settings.destinations) > 1 else "")
         + f"Периодичность проверки: раз в {settings.check_interval_minutes} мин."
     )
 
@@ -571,7 +639,7 @@ async def main() -> None:
     scheduler.start()
     log.info(
         "Бот запущен: %s -> %s, окно %s, проверка каждые %s мин.",
-        "/".join(settings.origins), settings.destination, _window_description(), settings.check_interval_minutes,
+        "/".join(settings.origins), "/".join(settings.destinations), _window_description(), settings.check_interval_minutes,
     )
     await scheduled_job()
     try:

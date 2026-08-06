@@ -45,13 +45,20 @@ jobs:
           TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
           TRAVELPAYOUTS_MARKER: ${{ secrets.TRAVELPAYOUTS_MARKER }}
           CHECK_INTERVAL_MINUTES: "10"  # держим в согласии с cron выше — это только для текста в /status, на расписание не влияет
-          # Билет MOW->CXR на 2 августа 18:40 уже куплен — сейчас ищем только
-          # стыковочный внутренний рейс MRV->MOW, хабы тут не нужны и выключены.
-          ORIGINS: "MRV"
-          DESTINATION: "MOW"
-          ENABLE_HUB_SEARCH: "false"
-          SEARCH_START_DATE: "2026-08-01"  # конкретная поездка, не скользящее окно — поменяй тут при новой поездке
-          SEARCH_END_DATE: "2026-08-02"
+          # Обратный маршрут: летим ИЗ Нячанга (плюс через вьетнамские хабы)
+          # В ЛЮБОЙ из четырёх городов, по приоритету (см. DESTINATION_NAMES
+          # и Settings.priority_margin_rub в config.py). MRV — самый
+          # приоритетный, дальше KRR, ASF, MOW — предпочитаем более
+          # приоритетный, если разница в пределах PRIORITY_MARGIN_RUB.
+          ORIGINS: "CXR"
+          DESTINATIONS: "MRV,KRR,ASF,MOW"
+          ENABLE_HUB_SEARCH: "true"
+          SEARCH_START_DATE: "2026-08-04"  # конкретная поездка, не скользящее окно — поменяй тут при новой поездке
+          SEARCH_END_DATE: "2026-08-15"
+          # Фоново мониторим цены ещё +10 дней после 15.08 (не показываем как
+          # варианты) — только чтобы понимать, дорого сейчас или дёшево
+          # относительно более широкого горизонта (см. market_stats в bot.py).
+          MARKET_CONTEXT_EXTRA_DAYS: "10"
         run: python run_once.py
 
       - name: Commit updated state
