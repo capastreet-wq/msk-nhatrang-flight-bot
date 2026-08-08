@@ -100,6 +100,14 @@ class Settings:
     # длинного горизонта.
     market_context_extra_days: int = 10
 
+    # Ни один билет (прямой ИЛИ каждая нога хаб-маршрута по отдельности) не
+    # предлагаем, если у него больше стольки пересадок (number_of_changes из
+    # сырых данных v2/prices/latest). Длинная международная нога хаб-
+    # маршрута и так требует буквально 0 пересадок (см. _search_via_hub) —
+    # это ограничение на неё тоже распространяется, но там оно заведомо
+    # слабее уже действующего требования.
+    max_transfers: int = 1
+
     check_interval_minutes: int = 20
     default_budget_rub: int = 30_000  # порог для отметки 🔥 — за ОДНОГО человека (сравнивается с ценой за взрослого, не с суммой на всю компанию)
     max_domestic_leg_rub: int = 8_000  # внутренний перелёт по Вьетнаму (нога хаб-маршрута) учитываем, только если дешевле этого
@@ -157,6 +165,7 @@ def load_settings() -> Settings:
         check_interval_minutes=int(os.environ.get("CHECK_INTERVAL_MINUTES", 20)),
         default_budget_rub=int(os.environ.get("DEFAULT_BUDGET_RUB", 30_000)),
         max_domestic_leg_rub=int(os.environ.get("MAX_DOMESTIC_LEG_RUB", 8_000)),
+        max_transfers=int(os.environ.get("MAX_TRANSFERS", 1)),
         priority_margin_rub=float(os.environ.get("PRIORITY_MARGIN_RUB", 10_000.0)),
         market_context_extra_days=int(os.environ.get("MARKET_CONTEXT_EXTRA_DAYS", 10)),
         min_hub_layover_hours=int(os.environ.get("MIN_HUB_LAYOVER_HOURS", 6)),

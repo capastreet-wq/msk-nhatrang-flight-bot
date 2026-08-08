@@ -96,6 +96,14 @@ def _baggage_hint(airline: str | None) -> str:
     return "🧳❓"
 
 
+def _within_transfer_limit(item: dict) -> bool:
+    """True, если у билета не больше settings.max_transfers пересадок
+    (number_of_changes из сырых данных v2/prices/latest). Отсутствие поля
+    трактуем как 0 пересадок (не как "неизвестно, но безопасно исключить")
+    — это соответствует наблюдаемому формату ответов API."""
+    return (item.get("raw") or {}).get("number_of_changes", 0) <= settings.max_transfers
+
+
 def _make_leg(origin: str, destination: str, item: dict, meta: dict | None = None) -> Leg:
     link = build_booking_link(
         origin, destination, item["date"],
@@ -127,7 +135,7 @@ async def _search_direct(origin_code: str, destination_code: str, start: date, e
     except Exception:
         log.exception("Ошибка поиска прямого варианта %s -> %s", origin_code, destination_code)
         return []
-    candidates = direct[:3]
+    candidates = [c for c in direct if _within_transfer_limit(c)][:3]
     try:
         meta_by_date = await _get_route_metadata(origin_code, destination_code, {c["date"] for c in candidates})
     except Exception:
@@ -156,12 +164,13 @@ async def _cheapest_direct_headline() -> str:
     today = date.today()
     near_end = today + timedelta(days=3)
     try:
-        candidates = await get_cheapest_in_window(tp_client, origin, destination, today, near_end)
+        raw_candidates = await get_cheapest_in_window(tp_client, origin, destination, today, near_end)
     except Exception:
         log.exception("Ошибка поиска ближайшего прямого рейса %s->%s", origin, destination)
         return f"✈️ Не удалось проверить ближайшие прямые рейсы {origin}→{destination} (ошибка API)\n\n"
+    candidates = [c for c in raw_candidates if _within_transfer_limit(c)]
     if not candidates:
-        return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{destination} не найдено в кэше Aviasales\n\n"
+        return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{destination} (≤{settings.max_transfers} пересадки) не найдено в кэше Aviasales\n\n"
     best = min(candidates, key=lambda c: c["price"])
     try:
         meta = await _get_route_metadata(origin, destination, {best["date"]})
@@ -212,7 +221,9 @@ async def _search_via_hub(
         return []
 
     if leg_a_is_domestic:
-        leg_a_candidates = [c for c in leg_a_all if c["price"] <= settings.max_domestic_leg_rub][:5]
+        leg_a_candidates = [
+            c for c in leg_a_all if c["price"] <= settings.max_domestic_leg_rub and _within_transfer_limit(c)
+        ][:5]
         leg_b_direct_only = [c for c in leg_b_all if (c.get("raw") or {}).get("number_of_changes") == 0]
     else:
         leg_a_candidates = [c for c in leg_a_all if (c.get("raw") or {}).get("number_of_changes") == 0][:5]
@@ -260,7 +271,9 @@ async def _search_via_hub(
             leg_b_item = leg_b_by_date.get(cand_date)
             if not leg_b_item:
                 continue
-            if leg_b_direct_only is None and leg_b_item["price"] > settings.max_domestic_leg_rub:
+            if leg_b_direct_only is None and (
+                leg_b_item["price"] > settings.max_domestic_leg_rub or not _within_transfer_limit(leg_b_item)
+            ):
                 continue
             leg_b_info = leg_b_meta.get(cand_date)
             leg_b_departure_at = leg_b_info.get("departure_at") if leg_b_info else None
