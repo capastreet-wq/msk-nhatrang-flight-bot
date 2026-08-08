@@ -3,11 +3,11 @@
     "6456883651": {
       "budget": null,
       "last_alert_price": 126378.0,
-      "last_alert_at": "2026-08-08T07:30:46.265817+00:00",
+      "last_alert_at": "2026-08-08T08:20:07.978027+00:00",
       "mrv_alert_price": 56955.0,
       "mrv_alert_at": "2026-08-02T15:43:20.485715+00:00",
       "priority_alert_price": 126378.0,
-      "priority_alert_at": "2026-08-08T07:30:46.265817+00:00"
+      "priority_alert_at": "2026-08-08T08:20:07.978027+00:00"
     }
   }
 }
