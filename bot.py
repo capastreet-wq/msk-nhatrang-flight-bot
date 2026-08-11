@@ -7,6 +7,7 @@ import logging
 import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -75,6 +76,7 @@ class Leg:
     airline: str | None = None
     departure_at: datetime | None = None  # локальное время вылета, как на билете (из v1/prices/calendar)
     gate: str | None = None  # где именно видели эту цену (Авиасейлс / Kupi.com / Aviakassa / ...) — см. _make_leg
+    transfers: int | None = None  # number_of_changes из сырых данных v2/prices/latest — сколько пересадок именно у этого сегмента
 
 
 @dataclass
@@ -112,10 +114,12 @@ def _make_leg(origin: str, destination: str, item: dict, meta: dict | None = Non
     )
     airline = (meta or {}).get("airline")
     departure_at = (meta or {}).get("departure_at")
-    gate = (item.get("raw") or {}).get("gate")
+    raw = item.get("raw") or {}
+    gate = raw.get("gate")
+    transfers = raw.get("number_of_changes")
     return Leg(
         origin=origin, destination=destination, date=item["date"], price=item["price"], link=link,
-        airline=airline, departure_at=departure_at, gate=gate,
+        airline=airline, departure_at=departure_at, gate=gate, transfers=transfers,
     )
 
 
@@ -190,11 +194,14 @@ async def _cheapest_direct_headline() -> str:
         meta = {}
     leg = _make_leg(origin, destination, best, meta.get(best["date"]))
     total_family = estimate_total_price(leg.price)
+    extra_link = ""
+    if leg.gate and leg.gate != "Авиасейлс":
+        extra_link = f"\nПоискать на {leg.gate}: {_gate_search_link(leg)}"
     return (
         f"✈️ Самый дешёвый прямой {origin}→{destination} на ближайшие 3 дня: "
         f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()} "
-        f"{_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n"
-        f"{leg.link}\n\n"
+        f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n"
+        f"{leg.link}{extra_link}\n\n"
     )
 
 
@@ -396,14 +403,51 @@ def _gate_hint(gate: str | None) -> str:
     return f" ⚠️ цена с {gate}, не с Aviasales — по ссылке может не найтись"
 
 
+# Домены только для тех gate, чьё имя однозначно совпадает с известным
+# доменом (проверено на реальных ответах v2/prices/latest). Для остальных
+# (City.Travel, SuperKassa и т.п.) домен НЕ угадываем — используем просто
+# имя в поисковом запросе, без site:, чтобы не сослаться на чужой сайт.
+_GATE_DOMAINS: dict[str, str] = {
+    "Kupi.com": "kupi.com",
+    "Aviakassa": "aviakassa.ru",
+}
+
+
+def _gate_search_link(leg: "Leg") -> str:
+    """Официальных диплинков для сторонних gate нет в открытом доступе
+    (проверено — ни Kupi.com/Aviakassa документации, ни у Skyscanner без
+    partner-регистрации, ни у Yandex Путешествий без обхода капчи), поэтому
+    вместо угаданного (и рискующего быть битым) диплинка — ссылка на поиск
+    Google по маршруту/дате, ограниченная доменом источника, если он точно
+    известен (см. _GATE_DOMAINS)."""
+    domain = _GATE_DOMAINS.get(leg.gate or "")
+    query = f"{leg.origin} {leg.destination} {leg.date:%d.%m.%Y} авиабилет"
+    query = f"site:{domain} {query}" if domain else f"{leg.gate} {query}"
+    return f"https://www.google.com/search?q={quote_plus(query)}"
+
+
+def _transfers_hint(transfers: int | None) -> str:
+    """✈️ + число пересадок именно у этого сегмента (не суммарно по всему
+    варианту — у маршрута через хаб у каждой ноги оно своё)."""
+    if transfers is None:
+        return "✈️?"
+    return f"✈️{transfers} {_plural_ru(transfers, 'пересадка', 'пересадки', 'пересадок')}"
+
+
+def _format_leg_line(leg: Leg) -> str:
+    line = (
+        f"  {leg.origin}→{leg.destination}, {_format_leg_datetime(leg)}: {leg.price:.0f} ₽/чел. "
+        f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n  {leg.link}"
+    )
+    if leg.gate and leg.gate != "Авиасейлс":
+        line += f"\n  Поискать на {leg.gate}: {_gate_search_link(leg)}"
+    return line
+
+
 def format_option(option: RouteOption) -> str:
     total_family = estimate_total_price(option.total_price)
     first_leg_dt = _format_leg_datetime(option.legs[0])
-    leg_lines = [
-        f"  {leg.origin}→{leg.destination}, {_format_leg_datetime(leg)}: {leg.price:.0f} ₽/чел. "
-        f"{_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n  {leg.link}"
-        for leg in option.legs
-    ]
+    leg_lines = [_format_leg_line(leg) for leg in option.legs]
     return (
         f"{first_leg_dt} — {option.label} — {option.total_price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()}\n"
         + "\n".join(leg_lines)
