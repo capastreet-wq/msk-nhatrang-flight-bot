@@ -116,11 +116,18 @@ async def get_cheapest_in_window(
     destination: str,
     start: date,
     end: date,
+    min_found_at: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Собирает one-way цены по дням в диапазоне [start, end], отсортированные
     по цене (дешевле -> дороже). Пропускает записи, которые оказались с
     заполненным return_date — Data API иногда всё равно подмешивает round-trip
-    даже при one_way=true, поэтому фильтруем дополнительно на нашей стороне."""
+    даже при one_way=true, поэтому фильтруем дополнительно на нашей стороне.
+
+    Также пропускает записи с actual=False (сам API помечает их как более не
+    актуальные) и, если задан min_found_at, записи, найденные раньше этого
+    момента — это НЕ гарантия, что билет ещё доступен по этой цене (это
+    кэш прошлых находок, а не живая инвентаризация), но снижает риск
+    показать совсем протухшую запись."""
     result: list[dict[str, Any]] = []
     for month in months_between(start, end):
         try:
@@ -130,6 +137,17 @@ async def get_cheapest_in_window(
         for item in items:
             if item.get("return_date"):
                 continue
+            if item.get("actual") is False:
+                continue
+            if min_found_at is not None:
+                found_at_raw = item.get("found_at")
+                if found_at_raw:
+                    try:
+                        found_at = datetime.fromisoformat(found_at_raw)
+                    except ValueError:
+                        found_at = None
+                    if found_at is not None and found_at < min_found_at:
+                        continue
             depart_date = item.get("depart_date")
             price = item.get("value") or item.get("price")
             if not (depart_date and price):

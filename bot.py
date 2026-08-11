@@ -74,6 +74,7 @@ class Leg:
     link: str
     airline: str | None = None
     departure_at: datetime | None = None  # локальное время вылета, как на билете (из v1/prices/calendar)
+    gate: str | None = None  # где именно видели эту цену (Авиасейлс / Kupi.com / Aviakassa / ...) — см. _make_leg
 
 
 @dataclass
@@ -111,9 +112,10 @@ def _make_leg(origin: str, destination: str, item: dict, meta: dict | None = Non
     )
     airline = (meta or {}).get("airline")
     departure_at = (meta or {}).get("departure_at")
+    gate = (item.get("raw") or {}).get("gate")
     return Leg(
         origin=origin, destination=destination, date=item["date"], price=item["price"], link=link,
-        airline=airline, departure_at=departure_at,
+        airline=airline, departure_at=departure_at, gate=gate,
     )
 
 
@@ -129,9 +131,18 @@ async def _get_route_metadata(origin: str, destination: str, dates: set) -> dict
     return {d: merged[d.isoformat()] for d in dates if d.isoformat() in merged}
 
 
+def _min_found_at() -> datetime:
+    """Отсекаем записи из v2/prices/latest, найденные (found_at) раньше этого
+    момента — см. settings.max_price_age_days. found_at у API наивный
+    (без явного пояса), сравниваем с наивным UTC-"сейчас" (не локальным
+    временем машины — иначе поведение отличалось бы между GitHub Actions
+    и локальным запуском в другом поясе)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=settings.max_price_age_days)
+
+
 async def _search_direct(origin_code: str, destination_code: str, start: date, end: date) -> list[RouteOption]:
     try:
-        direct = await get_cheapest_in_window(tp_client, origin_code, destination_code, start, end)
+        direct = await get_cheapest_in_window(tp_client, origin_code, destination_code, start, end, _min_found_at())
     except Exception:
         log.exception("Ошибка поиска прямого варианта %s -> %s", origin_code, destination_code)
         return []
@@ -164,7 +175,7 @@ async def _cheapest_direct_headline() -> str:
     today = date.today()
     near_end = today + timedelta(days=3)
     try:
-        raw_candidates = await get_cheapest_in_window(tp_client, origin, destination, today, near_end)
+        raw_candidates = await get_cheapest_in_window(tp_client, origin, destination, today, near_end, _min_found_at())
     except Exception:
         log.exception("Ошибка поиска ближайшего прямого рейса %s->%s", origin, destination)
         return f"✈️ Не удалось проверить ближайшие прямые рейсы {origin}→{destination} (ошибка API)\n\n"
@@ -181,7 +192,8 @@ async def _cheapest_direct_headline() -> str:
     total_family = estimate_total_price(leg.price)
     return (
         f"✈️ Самый дешёвый прямой {origin}→{destination} на ближайшие 3 дня: "
-        f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()} {_baggage_hint(leg.airline)}\n"
+        f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()} "
+        f"{_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n"
         f"{leg.link}\n\n"
     )
 
@@ -210,9 +222,10 @@ async def _search_via_hub(
     leg_a_is_domestic = origin_code in _VIETNAM_AIRPORTS  # origin уже во Вьетнаме — первая нога внутренняя
     dom_end = end + timedelta(days=settings.max_hub_layover_days)
     try:
+        min_found_at = _min_found_at()
         leg_a_all, leg_b_all = await asyncio.gather(
-            get_cheapest_in_window(tp_client, origin_code, hub_code, start, end),
-            get_cheapest_in_window(tp_client, hub_code, destination_code, start, dom_end),
+            get_cheapest_in_window(tp_client, origin_code, hub_code, start, end, min_found_at),
+            get_cheapest_in_window(tp_client, hub_code, destination_code, start, dom_end, min_found_at),
         )
     except Exception:
         log.exception("Ошибка поиска через хаб %s (%s -> %s)", hub_code, origin_code, destination_code)
@@ -370,11 +383,25 @@ def _format_leg_datetime(leg: Leg) -> str:
     return leg.date.strftime("%d.%m")
 
 
+def _gate_hint(gate: str | None) -> str:
+    """Цена в кэше могла быть найдена НЕ на самом Aviasales, а у стороннего
+    OTA (Kupi.com, Aviakassa и т.п.) — ссылка на бронирование всегда ведёт
+    на живой поиск Aviasales, у которого может не быть той же цены/брони
+    (другие агентские договорённости). Явно показываем источник, чтобы было
+    видно, когда цену стоит перепроверить не только по нашей ссылке."""
+    if not gate:
+        return ""
+    if gate == "Авиасейлс":
+        return ""
+    return f" ⚠️ цена с {gate}, не с Aviasales — по ссылке может не найтись"
+
+
 def format_option(option: RouteOption) -> str:
     total_family = estimate_total_price(option.total_price)
     first_leg_dt = _format_leg_datetime(option.legs[0])
     leg_lines = [
-        f"  {leg.origin}→{leg.destination}, {_format_leg_datetime(leg)}: {leg.price:.0f} ₽/чел. {_baggage_hint(leg.airline)}\n  {leg.link}"
+        f"  {leg.origin}→{leg.destination}, {_format_leg_datetime(leg)}: {leg.price:.0f} ₽/чел. "
+        f"{_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n  {leg.link}"
         for leg in option.legs
     ]
     return (
