@@ -194,14 +194,18 @@ async def _cheapest_direct_headline() -> str:
         meta = {}
     leg = _make_leg(origin, destination, best, meta.get(best["date"]))
     total_family = estimate_total_price(leg.price)
-    extra_link = ""
     if leg.gate and leg.gate != "Авиасейлс":
-        extra_link = f"\nПоискать на {leg.gate}: {_gate_search_link(leg)}"
+        links = (
+            f"Купить (искать на {leg.gate}): {_gate_search_link(leg)}\n"
+            f"Также проверить на Aviasales (может не найтись): {leg.link}"
+        )
+    else:
+        links = f"Купить: {leg.link}"
     return (
         f"✈️ Самый дешёвый прямой {origin}→{destination} на ближайшие 3 дня: "
         f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()} "
         f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n"
-        f"{leg.link}{extra_link}\n\n"
+        f"{links}\n\n"
     )
 
 
@@ -392,15 +396,20 @@ def _format_leg_datetime(leg: Leg) -> str:
 
 def _gate_hint(gate: str | None) -> str:
     """Цена в кэше могла быть найдена НЕ на самом Aviasales, а у стороннего
-    OTA (Kupi.com, Aviakassa и т.п.) — ссылка на бронирование всегда ведёт
-    на живой поиск Aviasales, у которого может не быть той же цены/брони
-    (другие агентские договорённости). Явно показываем источник, чтобы было
-    видно, когда цену стоит перепроверить не только по нашей ссылке."""
+    OTA (Kupi.com, Aviakassa и т.п.). Для приоритетных направлений (MRV/KRR/
+    ASF) это почти всегда так — проверено на живых данных: 0% кэша от gate
+    "Авиасейлс" (см. README). Живой браузерный тест (не просто curl)
+    подтвердил, что наша ссылка на aviasales.ru технически корректна и
+    открывает поиск именно с этим городом/датой/числом пассажиров — но
+    официальный календарь Aviasales для этих маршрутов почти пуст (для
+    CXR→ASF в августе — вообще ни одной даты), то есть у самого Aviasales,
+    похоже, просто нет актуальных данных по этому рейсу прямо сейчас,
+    независимо от корректности ссылки. Явно показываем источник."""
     if not gate:
         return ""
     if gate == "Авиасейлс":
         return ""
-    return f" ⚠️ цена с {gate}, не с Aviasales — по ссылке может не найтись"
+    return f" ⚠️ цена с {gate}"
 
 
 # Домены только для тех gate, чьё имя однозначно совпадает с известным
@@ -435,13 +444,19 @@ def _transfers_hint(transfers: int | None) -> str:
 
 
 def _format_leg_line(leg: Leg) -> str:
-    line = (
+    header = (
         f"  {leg.origin}→{leg.destination}, {_format_leg_datetime(leg)}: {leg.price:.0f} ₽/чел. "
-        f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n  {leg.link}"
+        f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}"
     )
     if leg.gate and leg.gate != "Авиасейлс":
-        line += f"\n  Поискать на {leg.gate}: {_gate_search_link(leg)}"
-    return line
+        # Цену впервые увидел не Aviasales, а этот gate — ссылку на его
+        # поиск ставим первой (реальный источник цены), а Aviasales —
+        # вторым вариантом, а не наоборот (см. _gate_hint почему).
+        return (
+            f"{header}\n  Купить (искать на {leg.gate}): {_gate_search_link(leg)}"
+            f"\n  Также проверить на Aviasales (может не найтись): {leg.link}"
+        )
+    return f"{header}\n  Купить: {leg.link}"
 
 
 def format_option(option: RouteOption) -> str:
