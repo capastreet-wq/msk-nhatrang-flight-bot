@@ -2,12 +2,12 @@
   "chats": {
     "6456883651": {
       "budget": null,
-      "last_alert_price": 106263.0,
-      "last_alert_at": "2026-08-12T23:25:43.327994+00:00",
+      "last_alert_price": 106287.0,
+      "last_alert_at": "2026-08-13T00:08:56.104489+00:00",
       "mrv_alert_price": 56955.0,
       "mrv_alert_at": "2026-08-02T15:43:20.485715+00:00",
-      "priority_alert_price": 106263.0,
-      "priority_alert_at": "2026-08-12T23:25:43.327994+00:00"
+      "priority_alert_price": 106287.0,
+      "priority_alert_at": "2026-08-13T00:08:56.104489+00:00"
     }
   }
 }
