@@ -50,6 +50,15 @@ def _total_label() -> str:
     return f"на {word}" if word else f"на {n} человек"
 
 
+def _total_price_suffix(total_price: float) -> str:
+    """При одном пассажире total_price совпадает с ценой за человека —
+    отдельно повторять то же число ещё раз ("X ₽/чел. ≈ X ₽ на одного")
+    незачем, показываем суффикс только при 2+ пассажирах."""
+    if settings.total_passengers <= 1:
+        return ""
+    return f" ≈ {total_price:.0f} ₽ {_total_label()}"
+
+
 def budget_for_chat(chat_id: int) -> int:
     """Порог для отметки 🔥 — в рублях ЗА ЧЕЛОВЕКА (сравнивается напрямую с
     ценой за взрослого, а не с суммой на всю компанию)."""
@@ -220,7 +229,7 @@ async def _cheapest_direct_headline() -> str:
         links = f"Купить: {leg.link}"
     return (
         f"✈️ Самый дешёвый прямой {origin}→{destination} на ближайшие 3 дня: "
-        f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()} "
+        f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел.{_total_price_suffix(total_family)} "
         f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n"
         f"{links}\n\n"
     )
@@ -481,7 +490,7 @@ def format_option(option: RouteOption) -> str:
     first_leg_dt = _format_leg_datetime(option.legs[0])
     leg_lines = [_format_leg_line(leg) for leg in option.legs]
     return (
-        f"{first_leg_dt} — {option.label} — {option.total_price:.0f} ₽/чел. ≈ {total_family:.0f} ₽ {_total_label()}\n"
+        f"{first_leg_dt} — {option.label} — {option.total_price:.0f} ₽/чел.{_total_price_suffix(total_family)}\n"
         + "\n".join(leg_lines)
     )
 
@@ -729,8 +738,9 @@ async def cmd_status(message: Message) -> None:
         f"{hub_lines}"
         f"Багаж: 🧳✅/❌/❓ по типу перевозчика (не по тарифу — сверяй при бронировании)\n"
         f"Окно поиска: {_window_description()}\n"
-        f"Пассажиры: {_passengers_description()} (все считаются взрослыми — детский "
-        "тариф обычно действует примерно до 12 лет)\n"
+        f"Пассажиры: {_passengers_description()}"
+        + (" (дети — детский тариф обычно действует примерно до 12 лет)" if settings.children else "")
+        + "\n"
         "Сигналы: пишу сам, БЕЗ запроса, на каждой проверке — чтобы было видно динамику цен, "
         "а не только моменты явных распродаж (те дополнительно отмечены 🔥/🎯)\n"
         f"Порог для отметки 🔥: {budget} ₽/чел.\n"
