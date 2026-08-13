@@ -56,9 +56,10 @@ class Store:
 
     def update_alert_state(self, chat_id: int, price: float, when_iso: str, prefix: str = "last_alert") -> None:
         """prefix позволяет вести независимые треки цен — например,
-        'last_alert' для лучшей цены в целом и 'mrv_alert' отдельно для
-        лучшей цены из Минеральных Вод, чтобы выгодный вариант оттуда не
-        терялся на фоне обычно более дешёвой Москвы."""
+        'last_alert' для лучшей цены в целом и 'priority_alert' отдельно
+        для лучшей цены в самом приоритетном городе назначения, чтобы
+        выгодный вариант оттуда не терялся на фоне более дешёвых
+        альтернатив в других городах DESTINATIONS."""
         with self._lock:
             chat = self._data["chats"].setdefault(str(chat_id), {})
             chat[f"{prefix}_price"] = price

@@ -107,6 +107,16 @@ def _within_transfer_limit(item: dict) -> bool:
     return (item.get("raw") or {}).get("number_of_changes", 0) <= settings.max_transfers
 
 
+def _within_price_cap(total_price: float) -> bool:
+    """Жёсткий потолок цены за человека (settings.max_price_rub) — в
+    отличие от default_budget_rub (только пометка 🔥, всё равно всё
+    показываем), варианты дороже вообще не предлагаем. Применяется к
+    ИТОГОВОЙ цене варианта (RouteOption.total_price), а не к цене
+    отдельной ноги — у маршрута через хаб потолок должен считаться от
+    суммы обеих ног, иначе можно случайно пропустить/отсечь не то."""
+    return settings.max_price_rub is None or total_price <= settings.max_price_rub
+
+
 def _make_leg(origin: str, destination: str, item: dict, meta: dict | None = None) -> Leg:
     link = build_booking_link(
         origin, destination, item["date"],
@@ -186,7 +196,14 @@ async def _cheapest_direct_headline() -> str:
     candidates = [c for c in raw_candidates if _within_transfer_limit(c)]
     if not candidates:
         return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{destination} (≤{settings.max_transfers} пересадки) не найдено в кэше Aviasales\n\n"
-    best = min(candidates, key=lambda c: c["price"])
+    candidates_in_budget = [c for c in candidates if _within_price_cap(c["price"])]
+    if not candidates_in_budget:
+        cheapest = min(candidates, key=lambda c: c["price"])
+        return (
+            f"✈️ На ближайшие 3 дня прямых билетов {origin}→{destination} дешевле "
+            f"{settings.max_price_rub:.0f} ₽/чел. нет (минимальная цена сейчас {cheapest['price']:.0f} ₽/чел.)\n\n"
+        )
+    best = min(candidates_in_budget, key=lambda c: c["price"])
     try:
         meta = await _get_route_metadata(origin, destination, {best["date"]})
     except Exception:
@@ -501,12 +518,25 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
         return
 
     median_price, sample_size = market_stats(all_options)
-    options = [o for o in all_options if o.legs[0].date <= window_end]
+    options_in_window = [o for o in all_options if o.legs[0].date <= window_end]
+    options = [o for o in options_in_window if _within_price_cap(o.total_price)]
     options.sort(key=lambda o: o.total_price)
     _apply_priority(options)
 
     if not options:
-        if force_reply:
+        # Потолок отсёк все варианты (данные ЕСТЬ, просто все дороже
+        # max_price_rub) — это полезная информация о динамике цены, шлём
+        # её на КАЖДОЙ проверке (не только force_reply), иначе бот с узким
+        # потолком будет молчать почти всегда, а не показывать "проверил,
+        # пока дорого".
+        if options_in_window and settings.max_price_rub is not None:
+            cheapest = min(o.total_price for o in options_in_window)
+            await bot.send_message(
+                chat_id,
+                headline_info + f"Есть билеты по направлению, но все дороже потолка "
+                f"{settings.max_price_rub:.0f} ₽/чел. (сейчас минимальная цена — {cheapest:.0f} ₽/чел.)",
+            )
+        elif force_reply:
             fallback_link = build_booking_link(
                 settings.origins[0], settings.destinations[0], start,
                 settings.adults, settings.children, settings.infants, settings.travelpayouts_marker,
@@ -706,6 +736,8 @@ async def cmd_status(message: Message) -> None:
         f"Порог для отметки 🔥: {budget} ₽/чел.\n"
         f"Отметка 🎯: цена ≤{MARKET_BEATING_RATIO*100:.0f}% от медианы по текущей выдаче — "
         "«заметно дешевле рынка», медиана считается заново на каждой проверке\n"
+        + (f"Жёсткий потолок цены: {settings.max_price_rub} ₽/чел. — дороже вообще не показываю\n"
+           if settings.max_price_rub is not None else "")
         + (f"Приоритетный город прилёта ({DESTINATION_NAMES.get(settings.destinations[0], settings.destinations[0])}) "
            "отслеживается отдельным треком — выгодный вариант по нему пришлю, даже если общий лучший "
            "вариант сейчас в другой город\n" if len(settings.destinations) > 1 else "")

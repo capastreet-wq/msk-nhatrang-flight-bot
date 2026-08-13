@@ -39,19 +39,19 @@ jobs:
           TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
           TRAVELPAYOUTS_MARKER: ${{ secrets.TRAVELPAYOUTS_MARKER }}
           CHECK_INTERVAL_MINUTES: "10"  # держим в согласии с cron выше — это только для текста в /status, на расписание не влияет
-          # Обратный маршрут: летим ИЗ Нячанга (плюс через вьетнамские хабы)
-          # В ЛЮБОЙ из четырёх городов, по приоритету (см. DESTINATION_NAMES
-          # и Settings.priority_margin_rub в config.py). MRV — самый
-          # приоритетный, дальше KRR, ASF, MOW — предпочитаем более
-          # приоритетный, если разница в пределах PRIORITY_MARGIN_RUB.
+          # Маршрут: летим ИЗ Нячанга (плюс через вьетнамские хабы) ВО
+          # Владивосток, не дороже MAX_PRICE_RUB за человека (жёсткий
+          # потолок — см. Settings.max_price_rub в config.py, дороже вообще
+          # не показываем, в отличие от DEFAULT_BUDGET_RUB).
           ORIGINS: "CXR"
-          DESTINATIONS: "MRV,KRR,ASF,MOW"
+          DESTINATIONS: "VVO"
           ENABLE_HUB_SEARCH: "true"
-          SEARCH_START_DATE: "2026-08-04"  # конкретная поездка, не скользящее окно — поменяй тут при новой поездке
-          SEARCH_END_DATE: "2026-08-15"
-          # Фоново мониторим цены ещё +10 дней после 15.08 (не показываем как
-          # варианты) — только чтобы понимать, дорого сейчас или дёшево
-          # относительно более широкого горизонта (см. market_stats в bot.py).
+          MAX_PRICE_RUB: "13000"
+          # Без SEARCH_START_DATE/SEARCH_END_DATE — скользящее окно от
+          # сегодня на SEARCH_WINDOW_DAYS дней (не конкретная поездка).
+          # Фоново мониторим цены ещё +10 дней за пределами этого окна (не
+          # показываем как варианты) — только чтобы понимать, дорого сейчас
+          # или дёшево относительно более широкого горизонта (market_stats).
           MARKET_CONTEXT_EXTRA_DAYS: "10"
         run: python run_once.py
 

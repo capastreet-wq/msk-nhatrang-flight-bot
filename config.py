@@ -34,6 +34,7 @@ DESTINATION_NAMES: dict[str, str] = {
     "KRR": "Краснодар",
     "ASF": "Астрахань",
     "CXR": "Нячанг",
+    "VVO": "Владивосток",
 }
 
 # Багаж в эконом-тарифе по умолчанию — это ОБЩЕЕ ЗНАНИЕ о бизнес-модели
@@ -120,6 +121,13 @@ class Settings:
     default_budget_rub: int = 30_000  # порог для отметки 🔥 — за ОДНОГО человека (сравнивается с ценой за взрослого, не с суммой на всю компанию)
     max_domestic_leg_rub: int = 8_000  # внутренний перелёт по Вьетнаму (нога хаб-маршрута) учитываем, только если дешевле этого
 
+    # Жёсткий потолок цены за ОДНОГО человека (₽) — в отличие от
+    # default_budget_rub (это просто порог для пометки 🔥, всё равно
+    # показываем всё), варианты дороже max_price_rub вообще ОТБРАСЫВАЮТСЯ
+    # и не попадают в сообщение — ни в топ вариантов, ни в заголовок с
+    # ближайшим прямым рейсом. None — потолка нет (прежнее поведение).
+    max_price_rub: int | None = None
+
     # Единый порог "почти одинаковая цена — выбираем по приоритету, а не по
     # минимальной цене" (bot.py::_apply_priority). Применяется в двух местах:
     # 1) прямой рейс vs рейс через хаб — прямой предпочитаем, если он дороже
@@ -158,6 +166,7 @@ def load_settings() -> Settings:
 
     raw_start = os.environ.get("SEARCH_START_DATE", "").strip()
     raw_end = os.environ.get("SEARCH_END_DATE", "").strip()
+    raw_max_price = os.environ.get("MAX_PRICE_RUB", "").strip()
 
     return Settings(
         telegram_token=telegram_token,
@@ -173,6 +182,7 @@ def load_settings() -> Settings:
         check_interval_minutes=int(os.environ.get("CHECK_INTERVAL_MINUTES", 20)),
         default_budget_rub=int(os.environ.get("DEFAULT_BUDGET_RUB", 30_000)),
         max_domestic_leg_rub=int(os.environ.get("MAX_DOMESTIC_LEG_RUB", 8_000)),
+        max_price_rub=int(raw_max_price) if raw_max_price else None,
         max_transfers=int(os.environ.get("MAX_TRANSFERS", 1)),
         max_price_age_days=int(os.environ.get("MAX_PRICE_AGE_DAYS", 5)),
         priority_margin_rub=float(os.environ.get("PRIORITY_MARGIN_RUB", 10_000.0)),
