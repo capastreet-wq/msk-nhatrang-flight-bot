@@ -99,11 +99,11 @@ class Settings:
 
     # Ни один билет (прямой ИЛИ каждая нога хаб-маршрута по отдельности) не
     # предлагаем, если у него больше стольки пересадок (number_of_changes из
-    # сырых данных v2/prices/latest). Длинная международная нога хаб-
-    # маршрута и так требует буквально 0 пересадок (см. _search_via_hub) —
-    # это ограничение на неё тоже распространяется, но там оно заведомо
-    # слабее уже действующего требования.
-    max_transfers: int = 1
+    # сырых данных v2/prices/latest). None — лимита нет (любое число
+    # пересадок подходит). Длинная международная нога хаб-маршрута и так
+    # требует буквально 0 пересадок (см. _search_via_hub) — это отдельное,
+    # не зависящее от max_transfers ограничение.
+    max_transfers: int | None = None
 
     # v2/prices/latest — это КЭШ цен, которые Aviasales и партнёрские OTA
     # (gate) уже где-то видели, а не живая инвентаризация: конкретная запись
@@ -163,6 +163,7 @@ def load_settings() -> Settings:
     raw_start = os.environ.get("SEARCH_START_DATE", "").strip()
     raw_end = os.environ.get("SEARCH_END_DATE", "").strip()
     raw_max_price = os.environ.get("MAX_PRICE_RUB", "").strip()
+    raw_max_transfers = os.environ.get("MAX_TRANSFERS", "").strip()
 
     return Settings(
         telegram_token=telegram_token,
@@ -179,7 +180,7 @@ def load_settings() -> Settings:
         default_budget_rub=int(os.environ.get("DEFAULT_BUDGET_RUB", 30_000)),
         max_domestic_leg_rub=int(os.environ.get("MAX_DOMESTIC_LEG_RUB", 8_000)),
         max_price_rub=int(raw_max_price) if raw_max_price else None,
-        max_transfers=int(os.environ.get("MAX_TRANSFERS", 1)),
+        max_transfers=int(raw_max_transfers) if raw_max_transfers else None,
         max_price_age_days=int(os.environ.get("MAX_PRICE_AGE_DAYS", 5)),
         priority_margin_rub=float(os.environ.get("PRIORITY_MARGIN_RUB", 10_000.0)),
         market_context_extra_days=int(os.environ.get("MARKET_CONTEXT_EXTRA_DAYS", 10)),

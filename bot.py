@@ -30,7 +30,6 @@ tp_client = TravelpayoutsClient(settings.travelpayouts_token, settings.currency)
 
 _VIETNAM_AIRPORTS = frozenset({"CXR", *HUBS.keys()})  # для определения, какая нога хаб-маршрута внутренняя, а какая международная
 
-ALERT_MEANINGFUL_DROP = 0.97  # в заголовке отмечаем "цена упала", если ниже последней увиденной минимум на 3%
 MARKET_BEATING_RATIO = 0.85   # цена <= 85% медианы по текущей выдаче — считаем "заметно дешевле рынка"
 
 
@@ -86,6 +85,7 @@ class Leg:
     departure_at: datetime | None = None  # локальное время вылета, как на билете (из v1/prices/calendar)
     gate: str | None = None  # где именно видели эту цену (Авиасейлс / Kupi.com / Aviakassa / ...) — см. _make_leg
     transfers: int | None = None  # number_of_changes из сырых данных v2/prices/latest — сколько пересадок именно у этого сегмента
+    duration_minutes: int | None = None  # duration из сырых данных v2/prices/latest, в минутах
 
 
 @dataclass
@@ -110,9 +110,12 @@ def _baggage_hint(airline: str | None) -> str:
 
 def _within_transfer_limit(item: dict) -> bool:
     """True, если у билета не больше settings.max_transfers пересадок
-    (number_of_changes из сырых данных v2/prices/latest). Отсутствие поля
-    трактуем как 0 пересадок (не как "неизвестно, но безопасно исключить")
-    — это соответствует наблюдаемому формату ответов API."""
+    (number_of_changes из сырых данных v2/prices/latest). None — лимита
+    нет, подходит любое число пересадок. Отсутствие поля трактуем как 0
+    пересадок (не как "неизвестно, но безопасно исключить") — это
+    соответствует наблюдаемому формату ответов API."""
+    if settings.max_transfers is None:
+        return True
     return (item.get("raw") or {}).get("number_of_changes", 0) <= settings.max_transfers
 
 
@@ -136,9 +139,11 @@ def _make_leg(origin: str, destination: str, item: dict, meta: dict | None = Non
     raw = item.get("raw") or {}
     gate = raw.get("gate")
     transfers = raw.get("number_of_changes")
+    duration_minutes = raw.get("duration")
     return Leg(
         origin=origin, destination=destination, date=item["date"], price=item["price"], link=link,
         airline=airline, departure_at=departure_at, gate=gate, transfers=transfers,
+        duration_minutes=duration_minutes,
     )
 
 
@@ -204,7 +209,8 @@ async def _cheapest_direct_headline() -> str:
         return f"✈️ Не удалось проверить ближайшие прямые рейсы {origin}→{destination} (ошибка API)\n\n"
     candidates = [c for c in raw_candidates if _within_transfer_limit(c)]
     if not candidates:
-        return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{destination} (≤{settings.max_transfers} пересадки) не найдено в кэше Aviasales\n\n"
+        limit_note = f" (≤{settings.max_transfers} пересадки)" if settings.max_transfers is not None else ""
+        return f"✈️ На ближайшие 3 дня прямых билетов {origin}→{destination}{limit_note} не найдено в кэше Aviasales\n\n"
     candidates_in_budget = [c for c in candidates if _within_price_cap(c["price"])]
     if not candidates_in_budget:
         cheapest = min(candidates, key=lambda c: c["price"])
@@ -230,7 +236,8 @@ async def _cheapest_direct_headline() -> str:
     return (
         f"✈️ Самый дешёвый прямой {origin}→{destination} на ближайшие 3 дня: "
         f"{_format_leg_datetime(leg)} — {leg.price:.0f} ₽/чел.{_total_price_suffix(total_family)} "
-        f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n"
+        f"{_transfers_hint(leg.transfers)} {_format_duration(leg.duration_minutes)} "
+        f"{_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}\n"
         f"{links}\n\n"
     )
 
@@ -469,10 +476,26 @@ def _transfers_hint(transfers: int | None) -> str:
     return f"✈️{transfers} {_plural_ru(transfers, 'пересадка', 'пересадки', 'пересадок')}"
 
 
+def _format_duration(minutes: int | None) -> str:
+    """⏱ время в пути именно этого сегмента (duration из сырых данных
+    v2/prices/latest, в минутах) — у маршрута через хаб это время ТОЛЬКО
+    этой ноги, не всей поездки целиком (время стыковки между ногами сюда
+    не входит)."""
+    if minutes is None:
+        return "⏱?"
+    h, m = divmod(int(minutes), 60)
+    if h and m:
+        return f"⏱{h}ч{m}мин"
+    if h:
+        return f"⏱{h}ч"
+    return f"⏱{m}мин"
+
+
 def _format_leg_line(leg: Leg) -> str:
     header = (
         f"  {leg.origin}→{leg.destination}, {_format_leg_datetime(leg)}: {leg.price:.0f} ₽/чел. "
-        f"{_transfers_hint(leg.transfers)} {_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}"
+        f"{_transfers_hint(leg.transfers)} {_format_duration(leg.duration_minutes)} "
+        f"{_baggage_hint(leg.airline)}{_gate_hint(leg.gate)}"
     )
     if leg.gate and leg.gate != "Авиасейлс":
         # Цену впервые увидел не Aviasales, а этот gate — ссылку на его
@@ -509,10 +532,15 @@ def _search_window() -> tuple[date, date]:
     return today, today + timedelta(days=settings.search_window_days)
 
 
-async def run_search(chat_id: int, *, force_reply: bool) -> None:
+async def run_search(chat_id: int) -> None:
+    """Только для /check (ручной запрос) — полная картина: заголовок с
+    ближайшим прямым рейсом, рыночная медиана, топ-5 вариантов, отдельный
+    блок приоритетного города, если он не попал в топ. Плановые фоновые
+    проверки используют _scheduled_check (алерт по потолку цены + дайджест
+    дважды в сутки) — совсем другая модель уведомлений, см. ниже."""
     start, window_end = _search_window()
     context_end = window_end + timedelta(days=settings.market_context_extra_days)
-    headline_info = await _cheapest_direct_headline()  # первая информация в любом сообщении, всегда
+    headline_info = await _cheapest_direct_headline()
 
     try:
         # Забираем сразу расширенное окно (+market_context_extra_days) одним
@@ -522,8 +550,7 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
         all_options = await gather_route_options(start, context_end)
     except Exception:
         log.exception("Ошибка запроса к Travelpayouts для чата %s", chat_id)
-        if force_reply:
-            await bot.send_message(chat_id, headline_info + "Не удалось получить данные от Travelpayouts, попробуй позже.")
+        await bot.send_message(chat_id, headline_info + "Не удалось получить данные от Travelpayouts, попробуй позже.")
         return
 
     median_price, sample_size = market_stats(all_options)
@@ -533,11 +560,6 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
     _apply_priority(options)
 
     if not options:
-        # Потолок отсёк все варианты (данные ЕСТЬ, просто все дороже
-        # max_price_rub) — это полезная информация о динамике цены, шлём
-        # её на КАЖДОЙ проверке (не только force_reply), иначе бот с узким
-        # потолком будет молчать почти всегда, а не показывать "проверил,
-        # пока дорого".
         if options_in_window and settings.max_price_rub is not None:
             cheapest = min(o.total_price for o in options_in_window)
             await bot.send_message(
@@ -545,7 +567,7 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
                 headline_info + f"Есть билеты по направлению, но все дороже потолка "
                 f"{settings.max_price_rub:.0f} ₽/чел. (сейчас минимальная цена — {cheapest:.0f} ₽/чел.)",
             )
-        elif force_reply:
+        else:
             fallback_link = build_booking_link(
                 settings.origins[0], settings.destinations[0], start,
                 settings.adults, settings.children, settings.infants, settings.travelpayouts_marker,
@@ -559,7 +581,6 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
         return
 
     best = options[0]
-    total_estimate = estimate_total_price(best.total_price)
     budget = budget_for_chat(chat_id)
 
     def _deal_tags(option: RouteOption) -> list[str]:
@@ -579,7 +600,6 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
     top_priority_destination = settings.destinations[0]
     priority_options = [o for o in options if o.legs[-1].destination == top_priority_destination]
     best_priority = priority_options[0] if priority_options else None
-    priority_total_estimate = estimate_total_price(best_priority.total_price) if best_priority else None
     priority_tags = _deal_tags(best_priority) if best_priority else []
 
     top_shown = options[:5]
@@ -590,36 +610,122 @@ async def run_search(chat_id: int, *, force_reply: bool) -> None:
         priority_name = DESTINATION_NAMES.get(top_priority_destination, top_priority_destination)
         body += f"\n\nОтдельно в {priority_name} (приоритетный город прилёта):\n{format_option(best_priority)}"
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    if force_reply:
-        await bot.send_message(chat_id, body)
-        store.update_alert_state(chat_id, total_estimate, now_iso)
-        if best_priority:
-            store.update_alert_state(chat_id, priority_total_estimate, now_iso, prefix="priority_alert")
-        return
-
-    # Плановая проверка шлёт сообщение КАЖДЫЙ РАЗ, не только когда выгодно —
-    # так видно динамику цен и можно понять, что на этом маршруте вообще
-    # считается средней ценой, а не только моменты явных распродаж (🔥/🎯).
-    chat = store.get_chat(chat_id)
-    last_price = chat.get("last_alert_price")
-    if last_price is None:
-        headline = "✈️ Первая проверка — вот что нашёл:"
-    elif total_estimate <= last_price * ALERT_MEANINGFUL_DROP:
-        headline = f"📉 Цена упала! Было {last_price:.0f} ₽, стало {total_estimate:.0f} ₽ (на всех):"
-    else:
-        headline = "📊 Текущие цены:"
+    headline = ""
     if overall_tags:
-        headline += "\n" + "\n".join(overall_tags)
+        headline = "\n".join(overall_tags) + "\n"
     if priority_tags:
         priority_name = DESTINATION_NAMES.get(top_priority_destination, top_priority_destination)
-        headline += f"\nВ {priority_name}: " + ", ".join(priority_tags)
+        headline += f"В {priority_name}: " + ", ".join(priority_tags) + "\n"
 
-    await bot.send_message(chat_id, f"{headline}\n\n{body}")
-    store.update_alert_state(chat_id, total_estimate, now_iso)
-    if best_priority:
-        store.update_alert_state(chat_id, priority_total_estimate, now_iso, prefix="priority_alert")
+    await bot.send_message(chat_id, f"{headline}\n{body}" if headline else body)
+
+
+_DIGEST_HOURS_UTC = (3, 15)  # ~10:00/22:00 по Вьетнаму, ~06:00/18:00 по Москве — время на усмотрение бота, раз в 12ч
+
+
+async def _check_cheap_alert(chat_id: int, options: list[RouteOption]) -> None:
+    """Часть 1 плановой проверки: билет дешевле settings.max_price_rub,
+    любое число пересадок (settings.max_transfers=None). Шлём только когда
+    он "появился" — новая цена или раньше вообще ничего не было — чтобы не
+    слать один и тот же билет заново на каждой проверке (~каждые 10 мин).
+    Если сейчас ничего нет — молчим, вообще не пишем (прямое указание
+    пользователя, в отличие от прежней модели "пишу на каждой проверке")."""
+    chat = store.get_chat(chat_id)
+    was_active = bool(chat.get("cheap_alert_active"))
+
+    if not options:
+        if was_active:
+            store.set_field(chat_id, "cheap_alert_active", False)
+        return
+
+    best = options[0]
+    if was_active and chat.get("cheap_alert_price") == best.total_price:
+        return
+
+    cap_note = f" дешевле {settings.max_price_rub:.0f} ₽" if settings.max_price_rub is not None else ""
+    await bot.send_message(chat_id, f"🔥 Нашёл билет{cap_note}!\n\n{format_option(best)}")
+    store.set_field(chat_id, "cheap_alert_active", True)
+    store.set_field(chat_id, "cheap_alert_price", best.total_price)
+
+
+async def _update_period_min(chat_id: int, all_options: list[RouteOption]) -> None:
+    """Часть 2 (накопление данных для дайджеста): среди ВСЕХ найденных на
+    этой проверке вариантов (без потолка цены и без лимита пересадок —
+    это просто срез рынка, не привязан к алерту из _check_cheap_alert)
+    запоминаем самый дешёвый за период с последнего отправленного
+    дайджеста (см. _maybe_send_digest)."""
+    if not all_options:
+        return
+    best = min(all_options, key=lambda o: o.total_price)
+    current_min = store.get_field(chat_id, "period_min_price")
+    if current_min is None or best.total_price < current_min:
+        store.set_field(chat_id, "period_min_price", best.total_price)
+        store.set_field(chat_id, "period_min_text", format_option(best))
+    if not store.get_field(chat_id, "period_since"):
+        store.set_field(chat_id, "period_since", datetime.now(timezone.utc).isoformat())
+
+
+async def _maybe_send_digest(chat_id: int, all_options: list[RouteOption]) -> None:
+    """Часть 3: дважды в сутки (см. _DIGEST_HOURS_UTC) шлём отдельное
+    сообщение — самая низкая цена ПРЯМО СЕЙЧАС и самая низкая цена ЗА
+    ПЕРИОД с прошлого дайджеста (накоплена в _update_period_min), с
+    пересадками и временем в пути у обеих. slot_key (дата+час) в state
+    защищает от повторной отправки, если за этот же час прогон случится
+    больше одного раза — GitHub Actions cron не гарантирует точность."""
+    now = datetime.now(timezone.utc)
+    if now.hour not in _DIGEST_HOURS_UTC:
+        return
+    slot_key = f"{now:%Y-%m-%d}:{now.hour}"
+    if store.get_field(chat_id, "digest_last_sent_key") == slot_key:
+        return
+
+    if all_options:
+        now_text = format_option(min(all_options, key=lambda o: o.total_price))
+    else:
+        now_text = "нет данных в кэше Aviasales прямо сейчас"
+    period_text = store.get_field(chat_id, "period_min_text") or "нет данных за этот период"
+    since_raw = store.get_field(chat_id, "period_since")
+    since_note = ""
+    if since_raw:
+        try:
+            since_note = f" (с {datetime.fromisoformat(since_raw):%d.%m %H:%M} UTC)"
+        except ValueError:
+            pass
+
+    await bot.send_message(
+        chat_id,
+        f"📅 Дайджест{since_note}\n\n"
+        f"Сейчас дешевле всего:\n{now_text}\n\n"
+        f"За этот период минимальная цена была:\n{period_text}",
+    )
+    store.set_field(chat_id, "digest_last_sent_key", slot_key)
+    store.set_field(chat_id, "period_min_price", None)
+    store.set_field(chat_id, "period_min_text", None)
+    store.set_field(chat_id, "period_since", now.isoformat())
+
+
+async def _scheduled_check(chat_id: int) -> None:
+    """Плановая (фоновая) проверка — вызывается на каждом прогоне ~раз в
+    10 минут (см. scheduled_job). В отличие от /check (run_search), здесь
+    ДВА независимых поведения:
+    1) _check_cheap_alert — билет дешевле потолка, шлём, только когда
+       появился; если нет — молчим;
+    2) _update_period_min + _maybe_send_digest — дважды в сутки дайджест
+       "сейчас/за период", независимо от потолка цены.
+    Обе части используют один и тот же поиск (без лишних запросов к API)."""
+    start, window_end = _search_window()
+    try:
+        all_options = await gather_route_options(start, window_end)
+    except Exception:
+        log.exception("Ошибка плановой проверки для чата %s", chat_id)
+        return
+
+    all_options.sort(key=lambda o: o.total_price)
+    in_budget = [o for o in all_options if _within_price_cap(o.total_price)]
+
+    await _check_cheap_alert(chat_id, in_budget)
+    await _update_period_min(chat_id, all_options)
+    await _maybe_send_digest(chat_id, all_options)
 
 
 def _window_description() -> str:
@@ -650,40 +756,26 @@ def _passengers_description() -> str:
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     store.subscribe(message.chat.id)
-    budget = budget_for_chat(message.chat.id)
     origins_names = " и ".join(ORIGIN_NAMES.get(o, o) for o in settings.origins)
-    destinations_names = " > ".join(DESTINATION_NAMES.get(d, d) for d in settings.destinations)
-    hub_line = (
-        f"{_window_description()} — включая варианты через хабы "
-        f"({', '.join(HUBS.values())}): прямой рейс показываю впереди рейса через хаб, только если "
-        f"экономия от пересадки не больше {settings.priority_margin_rub:.0f} ₽/чел., иначе показываю "
-        "маршрут через хаб.\n"
-        if settings.enable_hub_search
-        else f"{_window_description()}.\n"
+    hub_note = f" (включая варианты через хабы: {', '.join(HUBS.values())})" if settings.enable_hub_search else ""
+    transfers_note = f"≤{settings.max_transfers}" if settings.max_transfers is not None else "любое число"
+    cap_note = (
+        f"дешевле {settings.max_price_rub:.0f} ₽/чел." if settings.max_price_rub is not None else "по любой цене"
     )
-    destinations_line = (
-        f"Города прилёта — по приоритету: {destinations_names}. Если разница между ними не больше "
-        f"{settings.priority_margin_rub:.0f} ₽/чел. — предпочитаю более приоритетный, а не просто самый "
-        "дешёвый; если приоритетный ощутимо дороже, отмечаю его отдельной строкой, даже если он не "
-        "попал в топ по цене.\n"
-        if len(settings.destinations) > 1
-        else ""
-    )
+    h1, h2 = _DIGEST_HOURS_UTC
     await message.answer(
         "Привет! Слежу за билетами "
         f"{'/'.join(settings.origins)} → {'/'.join(settings.destinations)} (вылет из {origins_names}), "
-        f"в одну сторону, "
-        f"{_passengers_description()}, "
-        f"{hub_line}"
-        f"Проверяю раз в {settings.check_interval_minutes} мин. и пишу тебе САМ каждый раз — не нужно "
-        "спрашивать вручную. Так видно, как вообще меняются цены на маршруте, а не только моменты "
-        "явных распродаж — те дополнительно помечаю значками 🔥 (ниже твоего порога) и 🎯 (заметно "
-        "дешевле текущей медианы по рынку).\n"
-        f"{destinations_line}"
-        f"Порог для отметки 🔥: {budget} ₽/чел. (можно менять через /setbudget).\n\n"
+        f"в одну сторону, {_passengers_description()}, окно поиска {_window_description()}{hub_note}. "
+        f"Пересадки: {transfers_note}.\n\n"
+        f"Как только появится билет {cap_note} — пришлю сразу. Если сейчас такого нет — молчу, "
+        "лишний раз не пишу.\n"
+        f"Плюс дважды в сутки (~{h1:02d}:00 и ~{h2:02d}:00 UTC) присылаю дайджест: самая низкая цена "
+        "прямо сейчас и самая низкая за прошедший период — с числом пересадок и временем в пути у "
+        "обеих.\n\n"
         "Команды:\n"
-        "/check — проверить цены прямо сейчас\n"
-        "/setbudget 35000 — изменить порог отметки 🔥 (в рублях за человека)\n"
+        "/check — полная картина прямо сейчас (топ вариантов, не только по потолку)\n"
+        "/setbudget 35000 — порог отметки 🔥 в выдаче /check (в рублях за человека)\n"
         "/status — текущие настройки\n"
         "/stop — отписаться от уведомлений"
     )
@@ -704,8 +796,8 @@ async def cmd_setbudget(message: Message, command: CommandObject) -> None:
     budget = int(arg)
     store.set_budget(message.chat.id, budget)
     await message.answer(
-        f"Порог обновлён: {budget} ₽/чел. Учти: сигналы о новой лучшей цене приходят "
-        "в любом случае, порог только добавляет отметку 🔥, когда цена ещё и ниже него."
+        f"Порог обновлён: {budget} ₽/чел. Учти: это только для отметки 🔥 в выдаче /check — "
+        "на автоматические алерты и дайджест дважды в сутки не влияет (там свой жёсткий потолок, /status)."
     )
 
 
@@ -713,45 +805,41 @@ async def cmd_setbudget(message: Message, command: CommandObject) -> None:
 async def cmd_status(message: Message) -> None:
     budget = budget_for_chat(message.chat.id)
     origins_names = " и ".join(ORIGIN_NAMES.get(o, o) for o in settings.origins)
-    destinations_names = " > ".join(DESTINATION_NAMES.get(d, d) for d in settings.destinations)
-    hub_lines = (
+    hub_line = (
         f"Плюс варианты через хабы: {', '.join(f'{name} ({code})' for code, name in HUBS.items())} "
         f"— если внутренняя (по Вьетнаму) нога маршрута дешевле {settings.max_domestic_leg_rub} ₽\n"
-        f"Приоритет прямого рейса: хаб-маршрут показываю впереди прямого, только если экономит больше "
-        f"{settings.priority_margin_rub:.0f} ₽/чел. — иначе показываю прямой\n"
-        f"Запас на стыковку через хаб: ≥{settings.min_hub_layover_hours}ч, если время рейсов нашлось "
-        f"в календаре Aviasales; если нет — подстраховка минимум {settings.min_hub_layover_days} сутки "
-        "(с пометкой ⚠️ в названии варианта)\n"
         if settings.enable_hub_search
         else "Поиск через хабы: выключен (ENABLE_HUB_SEARCH=false)\n"
     )
-    destinations_line = (
-        f"Города прилёта по приоритету: {destinations_names} — разница до "
-        f"{settings.priority_margin_rub:.0f} ₽/чел. не в счёт, предпочитаю более приоритетный\n"
-        if len(settings.destinations) > 1
-        else ""
+    transfers_line = (
+        f"Пересадки: ≤{settings.max_transfers} на сегмент\n"
+        if settings.max_transfers is not None
+        else "Пересадки: без ограничений\n"
     )
+    cap_line = (
+        f"Жёсткий потолок цены: {settings.max_price_rub} ₽/чел. — дороже вообще не рассматриваю "
+        "ни в алерте, ни в дайджесте \"сейчас\"\n"
+        if settings.max_price_rub is not None
+        else "Жёсткий потолок цены: не задан\n"
+    )
+    h1, h2 = _DIGEST_HOURS_UTC
     await message.answer(
         f"Маршрут: {'/'.join(settings.origins)} → {'/'.join(settings.destinations)} (вылет из {origins_names}), "
         "в одну сторону\n"
-        f"{destinations_line}"
-        f"{hub_lines}"
+        f"{hub_line}"
+        f"{transfers_line}"
         f"Багаж: 🧳✅/❌/❓ по типу перевозчика (не по тарифу — сверяй при бронировании)\n"
         f"Окно поиска: {_window_description()}\n"
         f"Пассажиры: {_passengers_description()}"
         + (" (дети — детский тариф обычно действует примерно до 12 лет)" if settings.children else "")
         + "\n"
-        "Сигналы: пишу сам, БЕЗ запроса, на каждой проверке — чтобы было видно динамику цен, "
-        "а не только моменты явных распродаж (те дополнительно отмечены 🔥/🎯)\n"
-        f"Порог для отметки 🔥: {budget} ₽/чел.\n"
-        f"Отметка 🎯: цена ≤{MARKET_BEATING_RATIO*100:.0f}% от медианы по текущей выдаче — "
-        "«заметно дешевле рынка», медиана считается заново на каждой проверке\n"
-        + (f"Жёсткий потолок цены: {settings.max_price_rub} ₽/чел. — дороже вообще не показываю\n"
-           if settings.max_price_rub is not None else "")
-        + (f"Приоритетный город прилёта ({DESTINATION_NAMES.get(settings.destinations[0], settings.destinations[0])}) "
-           "отслеживается отдельным треком — выгодный вариант по нему пришлю, даже если общий лучший "
-           "вариант сейчас в другой город\n" if len(settings.destinations) > 1 else "")
-        + f"Периодичность проверки: раз в {settings.check_interval_minutes} мин."
+        f"{cap_line}"
+        "Алерт: как только появляется билет в пределах потолка — пишу сразу; если ничего нет — молчу\n"
+        f"Дайджест: дважды в сутки (~{h1:02d}:00 и ~{h2:02d}:00 UTC) — самая низкая цена сейчас и "
+        "минимальная за прошедший период, без потолка (просто срез рынка)\n"
+        f"/check показывает полную картину (топ вариантов), отметка 🔥 там при цене ≤{budget} ₽/чел. "
+        f"(меняется через /setbudget), 🎯 — при цене ≤{MARKET_BEATING_RATIO*100:.0f}% от медианы по выдаче\n"
+        f"Периодичность фоновой проверки: раз в {settings.check_interval_minutes} мин."
     )
 
 
@@ -759,13 +847,13 @@ async def cmd_status(message: Message) -> None:
 async def cmd_check(message: Message) -> None:
     store.subscribe(message.chat.id)
     await message.answer("Ищу цены, секунду…")
-    await run_search(message.chat.id, force_reply=True)
+    await run_search(message.chat.id)
 
 
 async def scheduled_job() -> None:
     for chat_id in store.all_chat_ids():
         try:
-            await run_search(chat_id, force_reply=False)
+            await _scheduled_check(chat_id)
         except Exception:
             log.exception("Ошибка планового поиска для чата %s", chat_id)
 

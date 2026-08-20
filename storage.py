@@ -30,10 +30,7 @@ class Store:
 
     def subscribe(self, chat_id: int) -> None:
         with self._lock:
-            self._data["chats"].setdefault(
-                str(chat_id),
-                {"budget": None, "last_alert_price": None, "last_alert_at": None},
-            )
+            self._data["chats"].setdefault(str(chat_id), {"budget": None})
             self._save()
 
     def unsubscribe(self, chat_id: int) -> None:
@@ -54,14 +51,15 @@ class Store:
             self._data["chats"].setdefault(str(chat_id), {})["budget"] = budget
             self._save()
 
-    def update_alert_state(self, chat_id: int, price: float, when_iso: str, prefix: str = "last_alert") -> None:
-        """prefix позволяет вести независимые треки цен — например,
-        'last_alert' для лучшей цены в целом и 'priority_alert' отдельно
-        для лучшей цены в самом приоритетном городе назначения, чтобы
-        выгодный вариант оттуда не терялся на фоне более дешёвых
-        альтернатив в других городах DESTINATIONS."""
+    def set_field(self, chat_id: int, key: str, value: Any) -> None:
+        """Универсальное хранение произвольных полей состояния по чату —
+        используется для трека алертов о дешёвых билетах, накопленного
+        минимума за период дайджеста и т.п. (см. bot.py)."""
         with self._lock:
             chat = self._data["chats"].setdefault(str(chat_id), {})
-            chat[f"{prefix}_price"] = price
-            chat[f"{prefix}_at"] = when_iso
+            chat[key] = value
             self._save()
+
+    def get_field(self, chat_id: int, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return self._data["chats"].get(str(chat_id), {}).get(key, default)
