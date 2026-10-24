@@ -8,10 +8,10 @@
       "mrv_alert_at": "2026-08-02T15:43:20.485715+00:00",
       "priority_alert_price": 130776.0,
       "priority_alert_at": "2026-08-13T06:07:53.497017+00:00",
-      "period_min_price": 16287.0,
-      "period_min_text": "29.10, вылет 08:45 — Прямой из Нячанга в Владивосток — 16287 ₽/чел.\n  CXR→VVO, 29.10, вылет 08:45: 16287 ₽/чел. ✈️0 пересадок ⏱6ч30мин 🧳❌ ⚠️ цена с Aviakassa\n  Купить (искать на Aviakassa): https://www.google.com/search?q=site%3Aaviakassa.ru+CXR+VVO+29.10.2026+%D0%B0%D0%B2%D0%B8%D0%B0%D0%B1%D0%B8%D0%BB%D0%B5%D1%82\n  Также проверить на Aviasales (может не найтись): https://www.aviasales.ru/search/CXR2910VVO1",
-      "period_since": "2026-10-21T15:40:04.616968+00:00",
-      "digest_last_sent_key": "2026-10-21:15",
+      "period_min_price": null,
+      "period_min_text": null,
+      "period_since": "2026-10-24T15:49:39.649406+00:00",
+      "digest_last_sent_key": "2026-10-24:15",
       "cheap_alert_active": false,
       "cheap_alert_price": 9357.0
     }
